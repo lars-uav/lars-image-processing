@@ -125,9 +125,13 @@ def main():
         for uploaded_file in uploaded_files:
             if uploaded_file.name not in st.session_state.processed_images:
                 img = Image.open(uploaded_file)
+                img_array = np.array(img)
+                # Apply white balance correction immediately upon loading
+                corrected_array = fix_white_balance(img_array)
                 st.session_state.processed_images[uploaded_file.name] = {
                     'original': img,
-                    'array': np.array(img),
+                    'array': img_array,
+                    'corrected_array': corrected_array,
                     'timestamp': datetime.now()
                 }
     
@@ -143,10 +147,7 @@ def main():
             
             # Get image data
             img_data = st.session_state.processed_images[st.session_state.selected_image]
-            img_array = img_data['array']
-            
-            # Process white balance
-            corrected_array = fix_white_balance(img_array)
+            corrected_array = img_data['corrected_array']
             
             # Index selection
             selected_indices = st.multiselect(
@@ -170,12 +171,12 @@ def main():
                     st.subheader("White Balance Corrected")
                     st.image(Image.fromarray(corrected_array), use_container_width=True)
                 
-                # Display selected indices
+                # Display selected indices (calculated on white-balanced image)
                 for idx, index_type in enumerate(selected_indices, 2):
                     with cols[idx]:
                         st.subheader(index_type)
-                        # Calculate and display index
-                        index_array = calculate_index(img_array, index_type)
+                        # Calculate index on white-balanced image
+                        index_array = calculate_index(corrected_array, index_type)
                         index_viz = create_index_visualization(index_array, index_type)
                         st.image(index_viz, use_container_width=True)
                         
@@ -204,6 +205,8 @@ def main():
         - Analyze individual images
         - Calculate multiple vegetation and water indices (NDVI, GNDVI, NDWI)
         - Get detailed statistics for each index
+        
+        Note: All indices are calculated on the white-balanced image for better accuracy.
         """)
         
         st.markdown("""
