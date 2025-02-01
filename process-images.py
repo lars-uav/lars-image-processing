@@ -60,9 +60,9 @@ def analyze_ndvi(ndvi_array):
     return stats
 
 def main():
-    st.set_page_config(layout="wide", page_title="RGNir Image Analyzer")
+    st.set_page_config(layout="wide", page_title="LARS Image Analyzer")
     
-    st.title("RGNir Image Analyzer")
+    st.title("LARS Image Analyzer")
     
     # File uploader
     uploaded_files = st.file_uploader(
