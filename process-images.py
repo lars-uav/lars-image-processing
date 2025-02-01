@@ -18,23 +18,54 @@ def fix_white_balance(img_array):
     
     return corrected.astype(np.uint8)
 
-def calculate_ndvi(img_array):
-    """Calculate NDVI from RGNir image"""
-    nir = img_array[:,:,2].astype(float)
-    red = img_array[:,:,0].astype(float)
+def calculate_index(img_array, index_type):
+    """Calculate various vegetation/water indices"""
+    # Convert to float for calculations
+    img_float = img_array.astype(float)
     
-    denominator = nir + red
-    ndvi = np.zeros_like(red)
-    valid = denominator != 0
-    ndvi[valid] = (nir[valid] - red[valid]) / denominator[valid]
+    # Extract bands (R, G, NIR)
+    red = img_float[:,:,0]
+    green = img_float[:,:,1]
+    nir = img_float[:,:,2]
     
-    return ndvi
+    # Avoid division by zero
+    epsilon = 1e-10
+    
+    if index_type == "NDVI":
+        # Normalized Difference Vegetation Index
+        numerator = nir - red
+        denominator = nir + red + epsilon
+        index = numerator / denominator
+    
+    elif index_type == "GNDVI":
+        # Green Normalized Difference Vegetation Index
+        numerator = nir - green
+        denominator = nir + green + epsilon
+        index = numerator / denominator
+    
+    elif index_type == "NDWI":
+        # Normalized Difference Water Index
+        numerator = green - nir
+        denominator = green + nir + epsilon
+        index = numerator / denominator
+    
+    else:
+        raise ValueError(f"Unknown index type: {index_type}")
+    
+    return np.clip(index, -1, 1)
 
-def create_ndvi_visualization(ndvi_array):
-    """Create colorful visualization of NDVI values"""
+def create_index_visualization(index_array, index_type):
+    """Create colorful visualization of index values"""
     fig, ax = plt.subplots(figsize=(10, 8))
-    im = ax.imshow(ndvi_array, cmap='RdYlGn', vmin=-1, vmax=1)
-    plt.colorbar(im, label='NDVI')
+    
+    # Choose colormap based on index type
+    if index_type == "NDWI":
+        cmap = 'RdYlBu'  # Blue for water
+    else:
+        cmap = 'RdYlGn'  # Green for vegetation
+    
+    im = ax.imshow(index_array, cmap=cmap, vmin=-1, vmax=1)
+    plt.colorbar(im, label=index_type)
     ax.axis('off')
     
     buf = io.BytesIO()
@@ -43,14 +74,22 @@ def create_ndvi_visualization(ndvi_array):
     buf.seek(0)
     return Image.open(buf)
 
-def analyze_ndvi(ndvi_array):
-    """Calculate NDVI statistics"""
+def analyze_index(index_array, index_type):
+    """Calculate statistics for the given index"""
+    threshold = 0.2  # Default threshold for vegetation/water detection
+    
+    if index_type == "NDWI":
+        feature_name = "Water"
+        threshold = 0.0  # Different threshold for water detection
+    else:
+        feature_name = "Vegetation"
+    
     stats = {
-        'Mean NDVI': float(np.mean(ndvi_array)),
-        'Median NDVI': float(np.median(ndvi_array)),
-        'Min NDVI': float(np.min(ndvi_array)),
-        'Max NDVI': float(np.max(ndvi_array)),
-        'Vegetation Coverage (%)': float(np.mean(ndvi_array > 0.2) * 100)
+        f'Mean {index_type}': float(np.mean(index_array)),
+        f'Median {index_type}': float(np.median(index_array)),
+        f'Min {index_type}': float(np.min(index_array)),
+        f'Max {index_type}': float(np.max(index_array)),
+        f'{feature_name} Coverage (%)': float(np.mean(index_array > threshold) * 100)
     }
     return stats
 
@@ -59,7 +98,7 @@ def create_image_gallery(images_dict):
     cols = st.columns(4)  # Show 4 images per row
     for idx, (name, img) in enumerate(images_dict.items()):
         with cols[idx % 4]:
-            st.image(img, caption=name, use_column_width=True)
+            st.image(img, caption=name, use_container_width=True)
             if st.button(f"Analyze {name}", key=f"btn_{name}"):
                 st.session_state.selected_image = name
 
@@ -106,41 +145,56 @@ def main():
             img_data = st.session_state.processed_images[st.session_state.selected_image]
             img_array = img_data['array']
             
-            # Process image
+            # Process white balance
             corrected_array = fix_white_balance(img_array)
-            ndvi_array = calculate_ndvi(img_array)
-            ndvi_viz = create_ndvi_visualization(ndvi_array)
             
-            # NDVI toggle
-            show_ndvi = st.toggle("Show NDVI Visualization", value=False)
+            # Index selection
+            selected_indices = st.multiselect(
+                "Select Indices to Display",
+                ["NDVI", "GNDVI", "NDWI"],
+                default=[]
+            )
             
-            # Display images based on toggle
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("Original")
-                st.image(img_data['original'], use_column_width=True)
-            
-            with col2:
-                if show_ndvi:
-                    st.subheader("NDVI")
-                    st.image(ndvi_viz, use_column_width=True)
-                else:
+            # Display images
+            if selected_indices:
+                # Calculate number of columns needed (original + white balance + selected indices)
+                num_cols = 2 + len(selected_indices)
+                cols = st.columns(num_cols)
+                
+                # Display original and white balance
+                with cols[0]:
+                    st.subheader("Original")
+                    st.image(img_data['original'], use_container_width=True)
+                
+                with cols[1]:
                     st.subheader("White Balance Corrected")
-                    st.image(Image.fromarray(corrected_array), use_column_width=True)
-            
-            # Display statistics
-            if show_ndvi:
-                st.subheader("NDVI Statistics")
-                stats = analyze_ndvi(ndvi_array)
+                    st.image(Image.fromarray(corrected_array), use_container_width=True)
                 
-                # Create columns for stats
-                stat_cols = st.columns(len(stats))
+                # Display selected indices
+                for idx, index_type in enumerate(selected_indices, 2):
+                    with cols[idx]:
+                        st.subheader(index_type)
+                        # Calculate and display index
+                        index_array = calculate_index(img_array, index_type)
+                        index_viz = create_index_visualization(index_array, index_type)
+                        st.image(index_viz, use_container_width=True)
+                        
+                        # Display statistics for each index
+                        st.write(f"{index_type} Statistics")
+                        stats = analyze_index(index_array, index_type)
+                        for key, value in stats.items():
+                            st.metric(key, f"{value:.3f}")
+            else:
+                # Show only original and white balance when no indices are selected
+                col1, col2 = st.columns(2)
                 
-                # Display stats in metric boxes
-                for col, (key, value) in zip(stat_cols, stats.items()):
-                    with col:
-                        st.metric(key, f"{value:.3f}")
+                with col1:
+                    st.subheader("Original")
+                    st.image(img_data['original'], use_container_width=True)
+                
+                with col2:
+                    st.subheader("White Balance Corrected")
+                    st.image(Image.fromarray(corrected_array), use_container_width=True)
     
     # Instructions when no file is uploaded
     else:
@@ -148,11 +202,16 @@ def main():
         Upload RGNir images to:
         - View them in a gallery format
         - Analyze individual images
-        - Toggle between white balance correction and NDVI visualization
-        - Get vegetation statistics
+        - Calculate multiple vegetation and water indices (NDVI, GNDVI, NDWI)
+        - Get detailed statistics for each index
         """)
         
         st.markdown("""
+        ### Available Indices:
+        - NDVI (Normalized Difference Vegetation Index)
+        - GNDVI (Green Normalized Difference Vegetation Index)
+        - NDWI (Normalized Difference Water Index)
+        
         ### Supported file formats:
         - TIFF (.tif, .tiff)
         - PNG (.png)
