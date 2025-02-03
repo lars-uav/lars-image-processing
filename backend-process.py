@@ -5,14 +5,14 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # Define paths
-INPUT_DIR = "mapir-test-images/Feb Photos/3rd Feb"
-OUTPUT_DIR = "mapir-test-images/Feb Photos/Processed"
+INPUT_DIR = "/Volumes/T7/Lars UAV/Mapir Images/Feb Photos/3rd Feb"
+OUTPUT_DIR = "/Volumes/T7/Lars UAV/Mapir Images/Feb Photos/Processed"
 
 # Configure processing options
-PROCESS_WB = True
-PROCESS_NDVI = True
+PROCESS_WB = False
+PROCESS_NDVI = False
 PROCESS_GNDVI = False
-PROCESS_NDWI = False
+PROCESS_NDWI = True
 
 def fix_white_balance(img):
     img_array = np.array(img, dtype=np.float32)
