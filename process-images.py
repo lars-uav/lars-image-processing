@@ -34,8 +34,9 @@ def init_connection():
         st.error(f"Failed to connect to MongoDB: {str(e)}")
         return None
 
-@st.cache_data
-def get_stored_images():
+# Modify get_stored_images to use a persistent cache key
+@st.cache_data(ttl=60)  # Cache for 60 seconds to prevent excessive database calls
+def get_stored_images(_cache_key=None):
     """Retrieve list of stored images from MongoDB"""
     try:
         client = init_connection()
@@ -90,6 +91,8 @@ def save_image_to_db(uploaded_file, timestamp):
         # Insert into MongoDB
         try:
             result = db.images.insert_one(document)
+            # Invalidate cache to force refresh
+            get_stored_images.clear()
             return str(result.inserted_id)
         except Exception as e:
             if "document too large" in str(e).lower():
@@ -111,6 +114,8 @@ def remove_image_from_db(image_id):
             
         db = client.rgnir_analyzer
         result = db.images.delete_one({'_id': ObjectId(image_id)})
+        # Invalidate cache to force refresh
+        get_stored_images.clear()
         return result.deleted_count > 0
     except Exception as e:
         st.error(f"Failed to remove image: {str(e)}")
@@ -232,46 +237,45 @@ def create_image_gallery(stored_images):
         st.info("No images found in the database")
         return
         
-    cols = st.columns(4)
-    displayed_image_ids = set()  # Track displayed image IDs to prevent duplicates
+    # Create a dynamic number of columns based on image count
+    num_cols = min(4, max(1, len(stored_images)))
+    cols = st.columns(num_cols)
     
     for idx, doc in enumerate(stored_images):
-        # Skip if this image has already been displayed
-        if doc['_id'] in displayed_image_ids:
-            continue
-        
-        with cols[idx % 4]:
-            # Load image data only when needed
+        with cols[idx % num_cols]:
+            # Load image data 
             image_data = load_image_from_db(doc['_id'])
             if image_data:
+                # Use a unique key for each image to prevent Streamlit state issues
+                image_key = f"image_{doc['_id']}"
+                
                 st.image(
                     image_data['original'],
                     caption=image_data['metadata']['filename'],
-                    use_container_width=True
+                    use_container_width=True,
+                    key=image_key
                 )
                 st.caption(f"Uploaded: {image_data['metadata']['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 # Create columns for Analyze and Remove buttons
                 button_cols = st.columns(2)
                 with button_cols[0]:
-                    if st.button(f"Analyze", key=f"btn_analyze_{doc['_id']}"):
+                    analyze_key = f"btn_analyze_{doc['_id']}"
+                    if st.button(f"Analyze", key=analyze_key):
                         st.session_state.selected_image = str(doc['_id'])
+                        # Force a rerun to update the page
+                        st.experimental_rerun()
+                
                 with button_cols[1]:
-                    if st.button("Remove", key=f"btn_remove_{doc['_id']}", type="secondary"):
+                    remove_key = f"btn_remove_{doc['_id']}"
+                    if st.button("Remove", key=remove_key, type="secondary"):
                         if remove_image_from_db(str(doc['_id'])):
                             st.success("Image removed successfully")
-                            # Clear cache to refresh image list
-                            get_stored_images.clear()
-                            # Reset selected image if it was the one removed
-                            if st.session_state.selected_image == str(doc['_id']):
-                                st.session_state.selected_image = None
-                            # Trigger rerun to refresh the page
-                            st.rerun()
+                            # Force a rerun to update the page
+                            st.experimental_rerun()
                         else:
                             st.error("Failed to remove image")
-                
-                # Add the image ID to displayed images to prevent duplicates
-                displayed_image_ids.add(doc['_id'])
+
 def main():
     st.set_page_config(layout="wide", page_title="RGNir Image Analyzer")
     st.title("RGNir Image Analyzer")
@@ -288,6 +292,7 @@ def main():
     # Add expander for database management
     with st.expander("Database Management"):
         if st.button("Clear All Images", type="secondary"):
+            # Add a confirmation step
             if st.button("Confirm Delete All Images?", type="primary"):
                 try:
                     client = init_connection()
@@ -295,9 +300,11 @@ def main():
                         db = client.rgnir_analyzer
                         db.images.delete_many({})
                         st.success("All images removed successfully")
+                        # Clear the cached images
                         get_stored_images.clear()
                         st.session_state.selected_image = None
-                        st.rerun()
+                        # Force a rerun
+                        st.experimental_rerun()
                 except Exception as e:
                     st.error(f"Failed to clear database: {str(e)}")
     
@@ -317,13 +324,13 @@ def main():
                     st.success(f"Successfully uploaded {uploaded_file.name}")
                 else:
                     st.error(f"Failed to upload {uploaded_file.name}")
-        # Clear cache to refresh image list
-        get_stored_images.clear()
-        st.rerun()
+        # Force a rerun to refresh the gallery
+        st.experimental_rerun()
     
     # Display gallery
     st.header("Image Gallery")
-    stored_images = get_stored_images()
+    # Use a cache key to force a refresh
+    stored_images = get_stored_images(datetime.now())
     create_image_gallery(stored_images)
     
     # Display analysis for selected image
