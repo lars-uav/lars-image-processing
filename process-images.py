@@ -39,6 +39,41 @@ def compute_file_hash(file_content):
     """Compute a hash of the file content to detect duplicates"""
     return hashlib.md5(file_content).hexdigest()
 
+def remove_duplicate_images():
+    """Remove duplicate images from the database"""
+    try:
+        client = init_connection()
+        if not client:
+            return 0
+            
+        db = client.rgnir_analyzer
+        
+        # Group images by their file hash
+        pipeline = [
+            {"$group": {
+                "_id": "$metadata.file_hash",
+                "count": {"$sum": 1},
+                "ids": {"$push": "$_id"}
+            }},
+            {"$match": {"count": {"$gt": 1}}}
+        ]
+        
+        duplicates = list(db.images.aggregate(pipeline))
+        
+        # Remove duplicate images, keeping the first one
+        total_removed = 0
+        for duplicate_group in duplicates:
+            # Keep the first ID, remove the rest
+            ids_to_remove = duplicate_group['ids'][1:]
+            result = db.images.delete_many({"_id": {"$in": ids_to_remove}})
+            total_removed += result.deleted_count
+        
+        return total_removed
+    
+    except Exception as e:
+        st.error(f"Failed to remove duplicate images: {str(e)}")
+        return 0
+
 def get_stored_images():
     """Retrieve list of stored images from MongoDB"""
     try:
@@ -320,6 +355,33 @@ def main():
                 if save_image_to_db(uploaded_file):
                     st.success(f"Successfully uploaded {uploaded_file.name}")
     
+    # Database Management Expander
+    with st.expander("Database Management"):
+        st.write("Database Maintenance Tools")
+        
+        # Remove Duplicates Button
+        if st.button("Remove Duplicate Images"):
+            removed_count = remove_duplicate_images()
+            if removed_count > 0:
+                st.success(f"Removed {removed_count} duplicate images")
+            else:
+                st.info("No duplicate images found")
+        
+        # Clear All Images Button
+        if st.button("Clear All Images", type="secondary"):
+            # Add a confirmation step
+            if st.button("Confirm Delete All Images?", type="primary"):
+                try:
+                    client = init_connection()
+                    if client:
+                        db = client.rgnir_analyzer
+                        db.images.delete_many({})
+                        st.success("All images removed successfully")
+                        # Trigger a rerun
+                        st.experimental_rerun()
+                except Exception as e:
+                    st.error(f"Failed to clear database: {str(e)}")
+    
     # Refresh Database Button
     if st.button("Refresh Database", key="refresh_button_unique"):
         st.session_state.stored_images = get_stored_images()
@@ -332,23 +394,6 @@ def main():
         create_image_gallery(st.session_state.stored_images)
     else:
         st.info("No images in the gallery. Use 'Refresh Database' or upload images.")
-    
-    # Database Management Expander
-    with st.expander("Database Management"):
-        if st.button("Clear All Images", type="secondary"):
-            # Add a confirmation step
-            if st.button("Confirm Delete All Images?", type="primary"):
-                try:
-                    client = init_connection()
-                    if client:
-                        db = client.rgnir_analyzer
-                        db.images.delete_many({})
-                        st.success("All images removed successfully")
-                        st.session_state.stored_images = []
-                        # Trigger a rerun
-                        st.experimental_rerun()
-                except Exception as e:
-                    st.error(f"Failed to clear database: {str(e)}")
 
 if __name__ == "__main__":
     main()
