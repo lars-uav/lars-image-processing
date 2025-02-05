@@ -1,4 +1,7 @@
+streamlit
+numpy
 pillow
-numpy
 matplotlib
-numpy
+pymongo
+python-dotenv
+dnspython
