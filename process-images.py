@@ -299,7 +299,8 @@ def main():
     uploaded_files = st.file_uploader(
         "Upload RGNir images", 
         type=['tif', 'tiff', 'png', 'jpg', 'jpeg'],
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        key="file_uploader"
     )
     
     # Process uploaded files
@@ -310,8 +311,10 @@ def main():
                 if save_image_to_db(uploaded_file, timestamp):
                     st.success(f"Successfully uploaded {uploaded_file.name}")
     
-    # Refresh Database Button
-    if st.button("Refresh Database"):
+    # Refresh Database Button with unique key to prevent rerun
+    refresh_key = "refresh_database_button"
+    if st.button("Refresh Database", key=refresh_key):
+        # Only fetch images if the button is pressed
         st.session_state.stored_images = get_stored_images()
     
     # Display gallery
