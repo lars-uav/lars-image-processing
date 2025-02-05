@@ -5,3 +5,4 @@ matplotlib
 pymongo
 python-dotenv
 dnspython
+pymongo[srv]
