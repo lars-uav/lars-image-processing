@@ -233,7 +233,13 @@ def create_image_gallery(stored_images):
         return
         
     cols = st.columns(4)
+    displayed_image_ids = set()  # Track displayed image IDs to prevent duplicates
+    
     for idx, doc in enumerate(stored_images):
+        # Skip if this image has already been displayed
+        if doc['_id'] in displayed_image_ids:
+            continue
+        
         with cols[idx % 4]:
             # Load image data only when needed
             image_data = load_image_from_db(doc['_id'])
@@ -263,7 +269,9 @@ def create_image_gallery(stored_images):
                             st.rerun()
                         else:
                             st.error("Failed to remove image")
-
+                
+                # Add the image ID to displayed images to prevent duplicates
+                displayed_image_ids.add(doc['_id'])
 def main():
     st.set_page_config(layout="wide", page_title="RGNir Image Analyzer")
     st.title("RGNir Image Analyzer")
