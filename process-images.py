@@ -7,6 +7,7 @@ from datetime import datetime
 import json
 from pymongo import MongoClient
 from bson.binary import Binary
+from bson.objectid import ObjectId
 import os
 from dotenv import load_dotenv
 
@@ -50,12 +51,27 @@ def get_stored_images():
 def save_image_to_db(uploaded_file, timestamp):
     """Save image and metadata to MongoDB"""
     try:
+        # Check file size
+        file_size = len(uploaded_file.getvalue()) / (1024 * 1024)  # Size in MB
+        if file_size > 16:
+            st.error(f"File size ({file_size:.1f}MB) exceeds MongoDB document limit (16MB). Please resize the image before uploading.")
+            return None
+
         client = init_connection()
         if not client:
             return None
             
         db = client.rgnir_analyzer
         
+        try:
+            # Verify image can be opened
+            img = Image.open(uploaded_file)
+            # Reset file pointer
+            uploaded_file.seek(0)
+        except Exception as e:
+            st.error(f"Invalid image file: {str(e)}")
+            return None
+            
         # Prepare image data
         img_bytes = uploaded_file.getvalue()
         
@@ -64,17 +80,41 @@ def save_image_to_db(uploaded_file, timestamp):
             'metadata': {
                 'filename': uploaded_file.name,
                 'timestamp': timestamp,
-                'upload_date': datetime.now()
+                'upload_date': datetime.now(),
+                'file_size_mb': file_size,
+                'image_dimensions': img.size
             },
             'image_data': Binary(img_bytes)  # Store as binary data
         }
         
         # Insert into MongoDB
-        result = db.images.insert_one(document)
-        return str(result.inserted_id)
+        try:
+            result = db.images.insert_one(document)
+            return str(result.inserted_id)
+        except Exception as e:
+            if "document too large" in str(e).lower():
+                st.error(f"File size ({file_size:.1f}MB) is too large for MongoDB. Please resize the image.")
+            else:
+                st.error(f"Database error: {str(e)}")
+            return None
+            
     except Exception as e:
-        st.error(f"Failed to save image: {str(e)}")
+        st.error(f"Failed to process image: {str(e)}")
         return None
+
+def remove_image_from_db(image_id):
+    """Remove image from MongoDB"""
+    try:
+        client = init_connection()
+        if not client:
+            return False
+            
+        db = client.rgnir_analyzer
+        result = db.images.delete_one({'_id': ObjectId(image_id)})
+        return result.deleted_count > 0
+    except Exception as e:
+        st.error(f"Failed to remove image: {str(e)}")
+        return False
 
 def load_image_from_db(image_id):
     """Load image data from MongoDB"""
@@ -84,7 +124,7 @@ def load_image_from_db(image_id):
             return None
             
         db = client.rgnir_analyzer
-        document = db.images.find_one({'_id': image_id})
+        document = db.images.find_one({'_id': ObjectId(image_id)})
         
         if document:
             img_bytes = document['image_data']
@@ -98,6 +138,7 @@ def load_image_from_db(image_id):
     except Exception as e:
         st.error(f"Failed to load image: {str(e)}")
         return None
+    
 def fix_white_balance(img_array):
     """Apply white balance correction to RGNir image"""
     img_float = img_array.astype(float)
@@ -203,8 +244,25 @@ def create_image_gallery(stored_images):
                     use_container_width=True
                 )
                 st.caption(f"Uploaded: {image_data['metadata']['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
-                if st.button(f"Analyze", key=f"btn_{doc['_id']}"):
-                    st.session_state.selected_image = str(doc['_id'])
+                
+                # Create columns for Analyze and Remove buttons
+                button_cols = st.columns(2)
+                with button_cols[0]:
+                    if st.button(f"Analyze", key=f"btn_analyze_{doc['_id']}"):
+                        st.session_state.selected_image = str(doc['_id'])
+                with button_cols[1]:
+                    if st.button("Remove", key=f"btn_remove_{doc['_id']}", type="secondary"):
+                        if remove_image_from_db(str(doc['_id'])):
+                            st.success("Image removed successfully")
+                            # Clear cache to refresh image list
+                            get_stored_images.clear()
+                            # Reset selected image if it was the one removed
+                            if st.session_state.selected_image == str(doc['_id']):
+                                st.session_state.selected_image = None
+                            # Trigger rerun to refresh the page
+                            st.rerun()
+                        else:
+                            st.error("Failed to remove image")
 
 def main():
     st.set_page_config(layout="wide", page_title="RGNir Image Analyzer")
@@ -218,6 +276,22 @@ def main():
     # Initialize session state
     if 'selected_image' not in st.session_state:
         st.session_state.selected_image = None
+    
+    # Add expander for database management
+    with st.expander("Database Management"):
+        if st.button("Clear All Images", type="secondary"):
+            if st.button("Confirm Delete All Images?", type="primary"):
+                try:
+                    client = init_connection()
+                    if client:
+                        db = client.rgnir_analyzer
+                        db.images.delete_many({})
+                        st.success("All images removed successfully")
+                        get_stored_images.clear()
+                        st.session_state.selected_image = None
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to clear database: {str(e)}")
     
     # File uploader
     uploaded_files = st.file_uploader(
@@ -237,6 +311,7 @@ def main():
                     st.error(f"Failed to upload {uploaded_file.name}")
         # Clear cache to refresh image list
         get_stored_images.clear()
+        st.rerun()
     
     # Display gallery
     st.header("Image Gallery")
