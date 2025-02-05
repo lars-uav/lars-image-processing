@@ -236,45 +236,43 @@ def create_image_gallery(stored_images):
     if not stored_images:
         st.info("No images found in the database")
         return
-        
+    
+    # Ensure we have a unique set of images
+    unique_images = {str(doc['_id']): doc for doc in stored_images}.values()
+    
     # Create a dynamic number of columns based on image count
-    num_cols = min(4, max(1, len(stored_images)))
+    num_cols = min(4, max(1, len(unique_images)))
     cols = st.columns(num_cols)
     
-    for idx, doc in enumerate(stored_images):
+    for idx, doc in enumerate(unique_images):
         with cols[idx % num_cols]:
             # Load image data 
             image_data = load_image_from_db(doc['_id'])
             if image_data:
-                # Use a unique key for each image to prevent Streamlit state issues
-                image_key = f"image_{doc['_id']}"
-                
                 st.image(
                     image_data['original'],
                     caption=image_data['metadata']['filename'],
-                    use_container_width=True,
-                    key=image_key
+                    use_container_width=True
                 )
                 st.caption(f"Uploaded: {image_data['metadata']['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 # Create columns for Analyze and Remove buttons
                 button_cols = st.columns(2)
                 with button_cols[0]:
-                    analyze_key = f"btn_analyze_{doc['_id']}"
-                    if st.button(f"Analyze", key=analyze_key):
+                    if st.button(f"Analyze#{str(doc['_id'])}"):
                         st.session_state.selected_image = str(doc['_id'])
                         # Force a rerun to update the page
                         st.experimental_rerun()
                 
                 with button_cols[1]:
-                    remove_key = f"btn_remove_{doc['_id']}"
-                    if st.button("Remove", key=remove_key, type="secondary"):
+                    if st.button(f"Remove#{str(doc['_id'])}", type="secondary"):
                         if remove_image_from_db(str(doc['_id'])):
                             st.success("Image removed successfully")
                             # Force a rerun to update the page
                             st.experimental_rerun()
                         else:
                             st.error("Failed to remove image")
+
 
 def main():
     st.set_page_config(layout="wide", page_title="RGNir Image Analyzer")
