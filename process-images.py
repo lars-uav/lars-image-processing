@@ -394,6 +394,55 @@ def main():
         create_image_gallery(st.session_state.stored_images)
     else:
         st.info("No images in the gallery. Use 'Refresh Database' or upload images.")
+    
+    # Image Analysis Section
+    if st.session_state.selected_image:
+        st.header("Image Analysis")
+        image_data = load_image_from_db(st.session_state.selected_image)
+        
+        if image_data:
+            # White balance correction
+            corrected_array = fix_white_balance(image_data['array'])
+            
+            # Index selection
+            selected_indices = st.multiselect(
+                "Select Indices to Display",
+                ["NDVI", "GNDVI", "NDWI"],
+                default=[]
+            )
+            
+            # Display images
+            if selected_indices:
+                num_cols = 2 + len(selected_indices)
+                cols = st.columns(num_cols)
+                
+                with cols[0]:
+                    st.subheader("Original")
+                    st.image(image_data['original'], use_container_width=True)
+                
+                with cols[1]:
+                    st.subheader("White Balance Corrected")
+                    st.image(Image.fromarray(corrected_array), use_container_width=True)
+                
+                for idx, index_type in enumerate(selected_indices, 2):
+                    with cols[idx]:
+                        st.subheader(index_type)
+                        index_array = calculate_index(corrected_array, index_type)
+                        index_viz = create_index_visualization(index_array, index_type)
+                        st.image(index_viz, use_container_width=True)
+                        
+                        st.write(f"{index_type} Statistics")
+                        stats = analyze_index(index_array, index_type)
+                        for key, value in stats.items():
+                            st.metric(key, f"{value:.3f}")
+            else:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.subheader("Original")
+                    st.image(image_data['original'], use_container_width=True)
+                with col2:
+                    st.subheader("White Balance Corrected")
+                    st.image(Image.fromarray(corrected_array), use_container_width=True)
 
 if __name__ == "__main__":
     main()
