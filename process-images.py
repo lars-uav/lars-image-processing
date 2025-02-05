@@ -58,7 +58,7 @@ def get_stored_images():
         st.error(f"Failed to retrieve images: {str(e)}")
         return []
 
-def save_image_to_db(uploaded_file, timestamp):
+def save_image_to_db(uploaded_file):
     """Save image and metadata to MongoDB, preventing duplicates"""
     try:
         # Check file size
@@ -80,7 +80,7 @@ def save_image_to_db(uploaded_file, timestamp):
         # Check if image with same hash already exists
         existing_image = db.images.find_one({'metadata.file_hash': file_hash})
         if existing_image:
-            st.warning(f"Image {uploaded_file.name} appears to be a duplicate and was not uploaded.")
+            st.warning(f"Image {uploaded_file.name} is a duplicate and was not uploaded.")
             return None
         
         try:
@@ -94,7 +94,6 @@ def save_image_to_db(uploaded_file, timestamp):
         document = {
             'metadata': {
                 'filename': uploaded_file.name,
-                'timestamp': timestamp,
                 'upload_date': datetime.now(),
                 'file_size_mb': file_size,
                 'image_dimensions': img.size,
@@ -265,7 +264,7 @@ def create_image_gallery(stored_images):
                     caption=image_data['metadata']['filename'],
                     use_container_width=True
                 )
-                st.caption(f"Uploaded: {image_data['metadata']['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+                st.caption(f"Uploaded: {image_data['metadata']['upload_date'].strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 # Create columns for Analyze and Remove buttons
                 button_cols = st.columns(2)
@@ -277,6 +276,8 @@ def create_image_gallery(stored_images):
                     if st.button(f"Remove_{str(doc['_id'])}", type="secondary"):
                         if remove_image_from_db(str(doc['_id'])):
                             st.success("Image removed successfully")
+                            # Trigger a rerun to refresh the page
+                            st.experimental_rerun()
 
 def main():
     st.set_page_config(layout="wide", page_title="RGNir Image Analyzer")
@@ -291,35 +292,46 @@ def main():
     if 'selected_image' not in st.session_state:
         st.session_state.selected_image = None
     
-    # Initialize stored images in session state if not exists
-    if 'stored_images' not in st.session_state:
-        st.session_state.stored_images = []
-    
-    # File uploader
+    # File uploader with unique key to prevent multiple uploads
     uploaded_files = st.file_uploader(
         "Upload RGNir images", 
         type=['tif', 'tiff', 'png', 'jpg', 'jpeg'],
         accept_multiple_files=True,
-        key="file_uploader"
+        key="file_uploader_unique"
     )
     
     # Process uploaded files
     if uploaded_files:
+        uploaded_hashes = set()
         with st.spinner("Processing uploaded images..."):
             for uploaded_file in uploaded_files:
-                timestamp = datetime.now()
-                if save_image_to_db(uploaded_file, timestamp):
+                # Compute hash before upload to check for duplicates
+                file_hash = compute_file_hash(uploaded_file.getvalue())
+                
+                # Skip if already processed in this batch
+                if file_hash in uploaded_hashes:
+                    st.warning(f"Skipping duplicate image: {uploaded_file.name}")
+                    continue
+                
+                # Add hash to processed set
+                uploaded_hashes.add(file_hash)
+                
+                # Attempt to save to database
+                if save_image_to_db(uploaded_file):
                     st.success(f"Successfully uploaded {uploaded_file.name}")
     
-    # Refresh Database Button with unique key to prevent rerun
-    refresh_key = "refresh_database_button"
-    if st.button("Refresh Database", key=refresh_key):
-        # Only fetch images if the button is pressed
+    # Refresh Database Button
+    if st.button("Refresh Database", key="refresh_button_unique"):
         st.session_state.stored_images = get_stored_images()
     
     # Display gallery
     st.header("Image Gallery")
-    create_image_gallery(st.session_state.stored_images)
+    
+    # Check if stored_images exists in session state
+    if 'stored_images' in st.session_state and st.session_state.stored_images:
+        create_image_gallery(st.session_state.stored_images)
+    else:
+        st.info("No images in the gallery. Use 'Refresh Database' or upload images.")
     
     # Database Management Expander
     with st.expander("Database Management"):
@@ -333,6 +345,8 @@ def main():
                         db.images.delete_many({})
                         st.success("All images removed successfully")
                         st.session_state.stored_images = []
+                        # Trigger a rerun
+                        st.experimental_rerun()
                 except Exception as e:
                     st.error(f"Failed to clear database: {str(e)}")
 
