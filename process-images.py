@@ -103,9 +103,9 @@ def create_image_gallery(images_dict):
                 st.session_state.selected_image = name
 
 def main():
-    st.set_page_config(layout="wide", page_title="RGNir Image Analyzer")
+    st.set_page_config(layout="wide", page_title="LARS Image Analyzer")
     
-    st.title("RGNir Image Analyzer")
+    st.title("LARS Image Analyzer")
     
     # Initialize session state
     if 'processed_images' not in st.session_state:
