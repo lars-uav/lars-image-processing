@@ -10,6 +10,7 @@ from bson.binary import Binary
 from bson.objectid import ObjectId
 import os
 from dotenv import load_dotenv
+import hashlib
 
 # Load environment variables
 load_dotenv()
@@ -34,9 +35,11 @@ def init_connection():
         st.error(f"Failed to connect to MongoDB: {str(e)}")
         return None
 
-# Modify get_stored_images to use a persistent cache key
-@st.cache_data(ttl=60)  # Cache for 60 seconds to prevent excessive database calls
-def get_stored_images(_cache_key=None):
+def compute_file_hash(file_content):
+    """Compute a hash of the file content to detect duplicates"""
+    return hashlib.md5(file_content).hexdigest()
+
+def get_stored_images():
     """Retrieve list of stored images from MongoDB"""
     try:
         client = init_connection()
@@ -44,16 +47,23 @@ def get_stored_images(_cache_key=None):
             return []
             
         db = client.rgnir_analyzer
-        return list(db.images.find({}, {'metadata': 1}).sort('metadata.timestamp', -1))
+        # Retrieve images sorted by timestamp, most recent first
+        images = list(db.images.find({}, {
+            'metadata': 1, 
+            '_id': 1
+        }).sort('metadata.upload_date', -1))
+        
+        return images
     except Exception as e:
         st.error(f"Failed to retrieve images: {str(e)}")
         return []
 
 def save_image_to_db(uploaded_file, timestamp):
-    """Save image and metadata to MongoDB"""
+    """Save image and metadata to MongoDB, preventing duplicates"""
     try:
         # Check file size
-        file_size = len(uploaded_file.getvalue()) / (1024 * 1024)  # Size in MB
+        file_content = uploaded_file.getvalue()
+        file_size = len(file_content) / (1024 * 1024)  # Size in MB
         if file_size > 16:
             st.error(f"File size ({file_size:.1f}MB) exceeds MongoDB document limit (16MB). Please resize the image before uploading.")
             return None
@@ -64,18 +74,22 @@ def save_image_to_db(uploaded_file, timestamp):
             
         db = client.rgnir_analyzer
         
+        # Compute file hash to check for duplicates
+        file_hash = compute_file_hash(file_content)
+        
+        # Check if image with same hash already exists
+        existing_image = db.images.find_one({'metadata.file_hash': file_hash})
+        if existing_image:
+            st.warning(f"Image {uploaded_file.name} appears to be a duplicate and was not uploaded.")
+            return None
+        
         try:
             # Verify image can be opened
-            img = Image.open(uploaded_file)
-            # Reset file pointer
-            uploaded_file.seek(0)
+            img = Image.open(io.BytesIO(file_content))
         except Exception as e:
             st.error(f"Invalid image file: {str(e)}")
             return None
             
-        # Prepare image data
-        img_bytes = uploaded_file.getvalue()
-        
         # Create document
         document = {
             'metadata': {
@@ -83,16 +97,15 @@ def save_image_to_db(uploaded_file, timestamp):
                 'timestamp': timestamp,
                 'upload_date': datetime.now(),
                 'file_size_mb': file_size,
-                'image_dimensions': img.size
+                'image_dimensions': img.size,
+                'file_hash': file_hash  # Store hash to prevent duplicates
             },
-            'image_data': Binary(img_bytes)  # Store as binary data
+            'image_data': Binary(file_content)  # Store as binary data
         }
         
         # Insert into MongoDB
         try:
             result = db.images.insert_one(document)
-            # Invalidate cache to force refresh
-            get_stored_images.clear()
             return str(result.inserted_id)
         except Exception as e:
             if "document too large" in str(e).lower():
@@ -114,8 +127,6 @@ def remove_image_from_db(image_id):
             
         db = client.rgnir_analyzer
         result = db.images.delete_one({'_id': ObjectId(image_id)})
-        # Invalidate cache to force refresh
-        get_stored_images.clear()
         return result.deleted_count > 0
     except Exception as e:
         st.error(f"Failed to remove image: {str(e)}")
@@ -237,14 +248,14 @@ def create_image_gallery(stored_images):
         st.info("No images found in the database")
         return
     
-    # Ensure we have a unique set of images
-    unique_images = {str(doc['_id']): doc for doc in stored_images}.values()
+    # Limit to 20 most recent images to prevent overwhelming the page
+    stored_images = stored_images[:20]
     
     # Create a dynamic number of columns based on image count
-    num_cols = min(4, max(1, len(unique_images)))
+    num_cols = min(4, max(1, len(stored_images)))
     cols = st.columns(num_cols)
     
-    for idx, doc in enumerate(unique_images):
+    for idx, doc in enumerate(stored_images):
         with cols[idx % num_cols]:
             # Load image data 
             image_data = load_image_from_db(doc['_id'])
@@ -259,20 +270,13 @@ def create_image_gallery(stored_images):
                 # Create columns for Analyze and Remove buttons
                 button_cols = st.columns(2)
                 with button_cols[0]:
-                    if st.button(f"Analyze#{str(doc['_id'])}"):
+                    if st.button(f"Analyze_{str(doc['_id'])}"):
                         st.session_state.selected_image = str(doc['_id'])
-                        # Force a rerun to update the page
-                        st.experimental_rerun()
                 
                 with button_cols[1]:
-                    if st.button(f"Remove#{str(doc['_id'])}", type="secondary"):
+                    if st.button(f"Remove_{str(doc['_id'])}", type="secondary"):
                         if remove_image_from_db(str(doc['_id'])):
                             st.success("Image removed successfully")
-                            # Force a rerun to update the page
-                            st.experimental_rerun()
-                        else:
-                            st.error("Failed to remove image")
-
 
 def main():
     st.set_page_config(layout="wide", page_title="RGNir Image Analyzer")
@@ -287,24 +291,9 @@ def main():
     if 'selected_image' not in st.session_state:
         st.session_state.selected_image = None
     
-    # Add expander for database management
-    with st.expander("Database Management"):
-        if st.button("Clear All Images", type="secondary"):
-            # Add a confirmation step
-            if st.button("Confirm Delete All Images?", type="primary"):
-                try:
-                    client = init_connection()
-                    if client:
-                        db = client.rgnir_analyzer
-                        db.images.delete_many({})
-                        st.success("All images removed successfully")
-                        # Clear the cached images
-                        get_stored_images.clear()
-                        st.session_state.selected_image = None
-                        # Force a rerun
-                        st.experimental_rerun()
-                except Exception as e:
-                    st.error(f"Failed to clear database: {str(e)}")
+    # Initialize stored images in session state if not exists
+    if 'stored_images' not in st.session_state:
+        st.session_state.stored_images = []
     
     # File uploader
     uploaded_files = st.file_uploader(
@@ -320,65 +309,29 @@ def main():
                 timestamp = datetime.now()
                 if save_image_to_db(uploaded_file, timestamp):
                     st.success(f"Successfully uploaded {uploaded_file.name}")
-                else:
-                    st.error(f"Failed to upload {uploaded_file.name}")
-        # Force a rerun to refresh the gallery
-        st.experimental_rerun()
+    
+    # Refresh Database Button
+    if st.button("Refresh Database"):
+        st.session_state.stored_images = get_stored_images()
     
     # Display gallery
     st.header("Image Gallery")
-    # Use a cache key to force a refresh
-    stored_images = get_stored_images(datetime.now())
-    create_image_gallery(stored_images)
+    create_image_gallery(st.session_state.stored_images)
     
-    # Display analysis for selected image
-    if st.session_state.selected_image:
-        image_data = load_image_from_db(st.session_state.selected_image)
-        if image_data:
-            st.header(f"Analysis: {image_data['metadata']['filename']}")
-            
-            # Process image for analysis
-            corrected_array = fix_white_balance(image_data['array'])
-            
-            # Index selection
-            selected_indices = st.multiselect(
-                "Select Indices to Display",
-                ["NDVI", "GNDVI", "NDWI"],
-                default=[]
-            )
-            
-            # Display images
-            if selected_indices:
-                num_cols = 2 + len(selected_indices)
-                cols = st.columns(num_cols)
-                
-                with cols[0]:
-                    st.subheader("Original")
-                    st.image(image_data['original'], use_container_width=True)
-                
-                with cols[1]:
-                    st.subheader("White Balance Corrected")
-                    st.image(Image.fromarray(corrected_array), use_container_width=True)
-                
-                for idx, index_type in enumerate(selected_indices, 2):
-                    with cols[idx]:
-                        st.subheader(index_type)
-                        index_array = calculate_index(corrected_array, index_type)
-                        index_viz = create_index_visualization(index_array, index_type)
-                        st.image(index_viz, use_container_width=True)
-                        
-                        st.write(f"{index_type} Statistics")
-                        stats = analyze_index(index_array, index_type)
-                        for key, value in stats.items():
-                            st.metric(key, f"{value:.3f}")
-            else:
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.subheader("Original")
-                    st.image(image_data['original'], use_container_width=True)
-                with col2:
-                    st.subheader("White Balance Corrected")
-                    st.image(Image.fromarray(corrected_array), use_container_width=True)
+    # Database Management Expander
+    with st.expander("Database Management"):
+        if st.button("Clear All Images", type="secondary"):
+            # Add a confirmation step
+            if st.button("Confirm Delete All Images?", type="primary"):
+                try:
+                    client = init_connection()
+                    if client:
+                        db = client.rgnir_analyzer
+                        db.images.delete_many({})
+                        st.success("All images removed successfully")
+                        st.session_state.stored_images = []
+                except Exception as e:
+                    st.error(f"Failed to clear database: {str(e)}")
 
 if __name__ == "__main__":
     main()
