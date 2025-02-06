@@ -327,35 +327,29 @@ def download_processed_images(image_data, corrected_array, selected_indices):
         bytes: Zip file content containing processed images
     """
     import zipfile
-    import os
-    import tempfile
+    import io
     
-    # Create a temporary directory for processed images
-    temp_dir = tempfile.mkdtemp()
+    # Create a bytes IO object for the zip file
+    zip_buffer = io.BytesIO()
     
-    # Prepare the zip file
-    zip_path = os.path.join(temp_dir, 'processed_images.zip')
-    
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
         # Save white balance corrected image
         corrected_img = Image.fromarray(corrected_array)
-        corrected_path = os.path.join(temp_dir, 'white_balanced.png')
-        corrected_img.save(corrected_path)
-        zipf.write(corrected_path, 'white_balanced.png')
+        corrected_buffer = io.BytesIO()
+        corrected_img.save(corrected_buffer, format='PNG')
+        zipf.writestr('white_balanced.png', corrected_buffer.getvalue())
         
         # Save index visualizations
         for index_type in selected_indices:
             index_array = calculate_index(corrected_array, index_type)
             index_viz = create_index_visualization(index_array, index_type)
-            index_path = os.path.join(temp_dir, f'{index_type}_visualization.png')
-            index_viz.save(index_path)
-            zipf.write(index_path, f'{index_type}_visualization.png')
+            index_buffer = io.BytesIO()
+            index_viz.save(index_buffer, format='PNG')
+            zipf.writestr(f'{index_type}_visualization.png', index_buffer.getvalue())
     
-    # Read the zip file
-    with open(zip_path, 'rb') as f:
-        zip_contents = f.read()
-    
-    return zip_contents
+    # Reset buffer position
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
 
 def main():
     st.set_page_config(layout="wide", page_title="RGNir Image Analyzer")
@@ -454,15 +448,17 @@ def main():
                 default=[]
             )
             
-            # Holder for download button
-            download_container = st.container()
-            
             # Display images and statistics
             st.subheader("Original")
             st.image(image_data['original'], use_container_width=True)
             
             st.subheader("White Balance Corrected")
             st.image(Image.fromarray(corrected_array), use_container_width=True)
+            
+            # Prepare download content
+            download_content = None
+            download_filename = None
+            download_mime = None
             
             # Process selected indices
             for index_type in selected_indices:
@@ -483,22 +479,27 @@ def main():
                 for key, value in stats.items():
                     st.metric(key, f"{value:.3f}")
             
-            # Add download button in the container
+            # Prepare download content
             if selected_indices:
-                download_container.download_button(
-                    label="Download Processed Images",
-                    data=download_processed_images(image_data, corrected_array, selected_indices),
-                    file_name=f"processed_images_{image_data['metadata']['filename']}.zip",
-                    mime="application/zip"
-                )
+                download_content = download_processed_images(image_data, corrected_array, selected_indices)
+                download_filename = f"processed_images_{image_data['metadata']['filename']}.zip"
+                download_mime = "application/zip"
             else:
-                # If no indices selected, allow downloading white balanced image
-                download_container.download_button(
-                    label="Download White Balanced Image",
-                    data=Image.fromarray(corrected_array).save(io.BytesIO(), format='PNG'),
-                    file_name=f"white_balanced_{image_data['metadata']['filename']}.png",
-                    mime="image/png"
-                )
+                # Convert corrected array to image
+                corrected_img = Image.fromarray(corrected_array)
+                buffer = io.BytesIO()
+                corrected_img.save(buffer, format='PNG')
+                download_content = buffer.getvalue()
+                download_filename = f"white_balanced_{image_data['metadata']['filename']}.png"
+                download_mime = "image/png"
+            
+            # Download button
+            st.download_button(
+                label="Download Processed Images",
+                data=download_content,
+                file_name=download_filename,
+                mime=download_mime
+            )
 
 if __name__ == "__main__":
     main()
