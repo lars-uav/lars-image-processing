@@ -314,6 +314,49 @@ def create_image_gallery(stored_images):
                             # Trigger a rerun to refresh the page
                             st.experimental_rerun()
 
+def download_processed_images(image_data, corrected_array, selected_indices):
+    """
+    Create a zip file of processed images for download.
+    
+    Args:
+        image_data (dict): Original image data from database
+        corrected_array (numpy.ndarray): White-balanced image array
+        selected_indices (list): List of selected vegetation/water indices
+    
+    Returns:
+        bytes: Zip file content containing processed images
+    """
+    import zipfile
+    import os
+    import tempfile
+    
+    # Create a temporary directory for processed images
+    temp_dir = tempfile.mkdtemp()
+    
+    # Prepare the zip file
+    zip_path = os.path.join(temp_dir, 'processed_images.zip')
+    
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # Save white balance corrected image
+        corrected_img = Image.fromarray(corrected_array)
+        corrected_path = os.path.join(temp_dir, 'white_balanced.png')
+        corrected_img.save(corrected_path)
+        zipf.write(corrected_path, 'white_balanced.png')
+        
+        # Save index visualizations
+        for index_type in selected_indices:
+            index_array = calculate_index(corrected_array, index_type)
+            index_viz = create_index_visualization(index_array, index_type)
+            index_path = os.path.join(temp_dir, f'{index_type}_visualization.png')
+            index_viz.save(index_path)
+            zipf.write(index_path, f'{index_type}_visualization.png')
+    
+    # Read the zip file
+    with open(zip_path, 'rb') as f:
+        zip_contents = f.read()
+    
+    return zip_contents
+
 def main():
     st.set_page_config(layout="wide", page_title="RGNir Image Analyzer")
     st.title("RGNir Image Analyzer")
@@ -411,38 +454,51 @@ def main():
                 default=[]
             )
             
-            # Display images
+            # Holder for download button
+            download_container = st.container()
+            
+            # Display images and statistics
+            st.subheader("Original")
+            st.image(image_data['original'], use_container_width=True)
+            
+            st.subheader("White Balance Corrected")
+            st.image(Image.fromarray(corrected_array), use_container_width=True)
+            
+            # Process selected indices
+            for index_type in selected_indices:
+                st.subheader(index_type)
+                
+                # Calculate index
+                index_array = calculate_index(corrected_array, index_type)
+                
+                # Create visualization
+                index_viz = create_index_visualization(index_array, index_type)
+                st.image(index_viz, use_container_width=True)
+                
+                # Analyze index
+                stats = analyze_index(index_array, index_type)
+                
+                # Display statistics
+                st.write(f"{index_type} Statistics")
+                for key, value in stats.items():
+                    st.metric(key, f"{value:.3f}")
+            
+            # Add download button in the container
             if selected_indices:
-                num_cols = 2 + len(selected_indices)
-                cols = st.columns(num_cols)
-                
-                with cols[0]:
-                    st.subheader("Original")
-                    st.image(image_data['original'], use_container_width=True)
-                
-                with cols[1]:
-                    st.subheader("White Balance Corrected")
-                    st.image(Image.fromarray(corrected_array), use_container_width=True)
-                
-                for idx, index_type in enumerate(selected_indices, 2):
-                    with cols[idx]:
-                        st.subheader(index_type)
-                        index_array = calculate_index(corrected_array, index_type)
-                        index_viz = create_index_visualization(index_array, index_type)
-                        st.image(index_viz, use_container_width=True)
-                        
-                        st.write(f"{index_type} Statistics")
-                        stats = analyze_index(index_array, index_type)
-                        for key, value in stats.items():
-                            st.metric(key, f"{value:.3f}")
+                download_container.download_button(
+                    label="Download Processed Images",
+                    data=download_processed_images(image_data, corrected_array, selected_indices),
+                    file_name=f"processed_images_{image_data['metadata']['filename']}.zip",
+                    mime="application/zip"
+                )
             else:
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.subheader("Original")
-                    st.image(image_data['original'], use_container_width=True)
-                with col2:
-                    st.subheader("White Balance Corrected")
-                    st.image(Image.fromarray(corrected_array), use_container_width=True)
+                # If no indices selected, allow downloading white balanced image
+                download_container.download_button(
+                    label="Download White Balanced Image",
+                    data=Image.fromarray(corrected_array).save(io.BytesIO(), format='PNG'),
+                    file_name=f"white_balanced_{image_data['metadata']['filename']}.png",
+                    mime="image/png"
+                )
 
 if __name__ == "__main__":
     main()
