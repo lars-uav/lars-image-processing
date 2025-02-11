@@ -311,7 +311,8 @@ def create_image_gallery(stored_images):
                     if st.button(f"Remove_{str(doc['_id'])}", type="secondary"):
                         if remove_image_from_db(str(doc['_id'])):
                             st.success("Image removed successfully")
-                            # Trigger a rerun to refresh the page
+                            # Update stored_images in session state before rerun
+                            st.session_state.stored_images = get_stored_images()
                             st.experimental_rerun()
 
 def download_processed_images(image_data, corrected_array, selected_indices):
