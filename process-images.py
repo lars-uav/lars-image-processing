@@ -361,9 +361,11 @@ def main():
         st.error("Failed to connect to database. Please check your connection settings.")
         return
     
-    # Initialize session state
+    # Initialize session state for both selected_image and stored_images
     if 'selected_image' not in st.session_state:
         st.session_state.selected_image = None
+    if 'stored_images' not in st.session_state:
+        st.session_state.stored_images = get_stored_images()
     
     # File uploader with unique key to prevent multiple uploads
     uploaded_files = st.file_uploader(
@@ -392,6 +394,8 @@ def main():
                 # Attempt to save to database
                 if save_image_to_db(uploaded_file):
                     st.success(f"Successfully uploaded {uploaded_file.name}")
+                    # Update stored_images after successful upload
+                    st.session_state.stored_images = get_stored_images()
     
     # Database Management Expander
     with st.expander("Database Management"):
@@ -402,6 +406,8 @@ def main():
             removed_count = remove_duplicate_images()
             if removed_count > 0:
                 st.success(f"Removed {removed_count} duplicate images")
+                # Update stored_images after removing duplicates
+                st.session_state.stored_images = get_stored_images()
             else:
                 st.info("No duplicate images found")
         
@@ -415,7 +421,8 @@ def main():
                         db = client.rgnir_analyzer
                         db.images.delete_many({})
                         st.success("All images removed successfully")
-                        # Trigger a rerun
+                        # Update stored_images after clearing database
+                        st.session_state.stored_images = get_stored_images()
                         st.experimental_rerun()
                 except Exception as e:
                     st.error(f"Failed to clear database: {str(e)}")
@@ -426,12 +433,7 @@ def main():
     
     # Display gallery
     st.header("Image Gallery")
-    
-    # Check if stored_images exists in session state
-    if 'stored_images' in st.session_state and st.session_state.stored_images:
-        create_image_gallery(st.session_state.stored_images)
-    else:
-        st.info("No images in the gallery. Use 'Refresh Database' or upload images.")
+    create_image_gallery(st.session_state.stored_images)
     
     # Image Analysis Section
     if st.session_state.selected_image:
