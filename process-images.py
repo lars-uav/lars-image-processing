@@ -352,6 +352,70 @@ def download_processed_images(image_data, corrected_array, selected_indices):
     zip_buffer.seek(0)
     return zip_buffer.getvalue()
 
+def create_comparison_view(image_data_list, index_type=None):
+    """Create a side-by-side comparison view of multiple images
+    
+    Args:
+        image_data_list (list): List of image data dictionaries
+        index_type (str, optional): Type of index to compare (NDVI, GNDVI, NDWI)
+        
+    Returns:
+        tuple: Combined figure and statistics dictionary
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from PIL import Image
+    
+    n_images = len(image_data_list)
+    if n_images == 0:
+        return None, {}
+        
+    # Create figure with subplots
+    fig, axes = plt.subplots(1, n_images, figsize=(5*n_images, 4))
+    if n_images == 1:
+        axes = [axes]
+    
+    all_stats = {}
+    
+    for idx, (ax, image_data) in enumerate(zip(axes, image_data_list)):
+        # Get image data
+        if index_type:
+            # Calculate vegetation/water index
+            corrected_array = fix_white_balance(image_data['array'])
+            index_array = calculate_index(corrected_array, index_type)
+            
+            # Create visualization
+            if index_type == "NDWI":
+                cmap = 'RdYlBu'
+            else:
+                cmap = 'RdYlGn'
+            
+            im = ax.imshow(index_array, cmap=cmap, vmin=-1, vmax=1)
+            plt.colorbar(im, ax=ax, label=index_type)
+            
+            # Calculate statistics
+            stats = analyze_index(index_array, index_type)
+            all_stats[image_data['metadata']['filename']] = stats
+        else:
+            # Show original or white-balanced image
+            corrected_array = fix_white_balance(image_data['array'])
+            ax.imshow(corrected_array)
+        
+        # Set title with filename
+        ax.set_title(image_data['metadata']['filename'], fontsize=8)
+        ax.axis('off')
+    
+    plt.tight_layout()
+    
+    # Convert plot to image
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1, dpi=150)
+    plt.close()
+    buf.seek(0)
+    comparison_image = Image.open(buf)
+    
+    return comparison_image, all_stats
+
 def main():
     st.set_page_config(layout="wide", page_title="RGNir Image Analyzer")
     st.title("RGNir Image Analyzer")
