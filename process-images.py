@@ -417,6 +417,7 @@ def create_comparison_view(image_data_list, index_type=None):
     return comparison_image, all_stats
 
 def main():
+    """Updated main function with comparison functionality"""
     st.set_page_config(layout="wide", page_title="RGNir Image Analyzer")
     st.title("RGNir Image Analyzer")
     
@@ -425,13 +426,13 @@ def main():
         st.error("Failed to connect to database. Please check your connection settings.")
         return
     
-    # Initialize session state for both selected_image and stored_images
-    if 'selected_image' not in st.session_state:
-        st.session_state.selected_image = None
+    # Initialize session state
+    if 'selected_images' not in st.session_state:
+        st.session_state.selected_images = []
     if 'stored_images' not in st.session_state:
         st.session_state.stored_images = get_stored_images()
     
-    # File uploader with unique key to prevent multiple uploads
+    # File uploader section (unchanged)
     uploaded_files = st.file_uploader(
         "Upload RGNir images", 
         type=['tif', 'tiff', 'png', 'jpg', 'jpeg'],
@@ -439,45 +440,33 @@ def main():
         key="file_uploader_unique"
     )
     
-    # Process uploaded files
+    # Process uploaded files (unchanged)
     if uploaded_files:
         uploaded_hashes = set()
         with st.spinner("Processing uploaded images..."):
             for uploaded_file in uploaded_files:
-                # Compute hash before upload to check for duplicates
                 file_hash = compute_file_hash(uploaded_file.getvalue())
-                
-                # Skip if already processed in this batch
                 if file_hash in uploaded_hashes:
                     st.warning(f"Skipping duplicate image: {uploaded_file.name}")
                     continue
-                
-                # Add hash to processed set
                 uploaded_hashes.add(file_hash)
-                
-                # Attempt to save to database
                 if save_image_to_db(uploaded_file):
                     st.success(f"Successfully uploaded {uploaded_file.name}")
-                    # Update stored_images after successful upload
                     st.session_state.stored_images = get_stored_images()
     
-    # Database Management Expander
+    # Database Management section (unchanged)
     with st.expander("Database Management"):
         st.write("Database Maintenance Tools")
         
-        # Remove Duplicates Button
         if st.button("Remove Duplicate Images"):
             removed_count = remove_duplicate_images()
             if removed_count > 0:
                 st.success(f"Removed {removed_count} duplicate images")
-                # Update stored_images after removing duplicates
                 st.session_state.stored_images = get_stored_images()
             else:
                 st.info("No duplicate images found")
         
-        # Clear All Images Button
         if st.button("Clear All Images", type="secondary"):
-            # Add a confirmation step
             if st.button("Confirm Delete All Images?", type="primary"):
                 try:
                     client = init_connection()
@@ -485,7 +474,6 @@ def main():
                         db = client.rgnir_analyzer
                         db.images.delete_many({})
                         st.success("All images removed successfully")
-                        # Update stored_images after clearing database
                         st.session_state.stored_images = get_stored_images()
                         st.experimental_rerun()
                 except Exception as e:
@@ -495,77 +483,101 @@ def main():
     if st.button("Refresh Database", key="refresh_button_unique"):
         st.session_state.stored_images = get_stored_images()
     
-    # Display gallery
+    # Modified Gallery Section with Multi-select
     st.header("Image Gallery")
-    create_image_gallery(st.session_state.stored_images)
-    
-    # Image Analysis Section
-    if st.session_state.selected_image:
-        st.header("Image Analysis")
-        image_data = load_image_from_db(st.session_state.selected_image)
+    if not st.session_state.stored_images:
+        st.info("No images found in the database")
+    else:
+        # Create columns for gallery
+        num_cols = min(4, max(1, len(st.session_state.stored_images)))
+        cols = st.columns(num_cols)
         
-        if image_data:
-            # White balance correction
-            corrected_array = fix_white_balance(image_data['array'])
+        for idx, doc in enumerate(st.session_state.stored_images[:20]):
+            with cols[idx % num_cols]:
+                image_data = load_image_from_db(doc['_id'])
+                if image_data:
+                    st.image(
+                        image_data['original'],
+                        caption=image_data['metadata']['filename'],
+                        use_container_width=True
+                    )
+                    st.caption(f"Uploaded: {image_data['metadata']['upload_date'].strftime('%Y-%m-%d %H:%M:%S')}")
+                    
+                    # Add checkbox for selection
+                    if st.checkbox(f"Select for comparison {str(doc['_id'])}", 
+                                 value=str(doc['_id']) in st.session_state.selected_images):
+                        if str(doc['_id']) not in st.session_state.selected_images:
+                            st.session_state.selected_images.append(str(doc['_id']))
+                    else:
+                        if str(doc['_id']) in st.session_state.selected_images:
+                            st.session_state.selected_images.remove(str(doc['_id']))
+                    
+                    # Remove button
+                    if st.button(f"Remove_{str(doc['_id'])}", type="secondary"):
+                        if remove_image_from_db(str(doc['_id'])):
+                            st.success("Image removed successfully")
+                            if str(doc['_id']) in st.session_state.selected_images:
+                                st.session_state.selected_images.remove(str(doc['_id']))
+                            st.session_state.stored_images = get_stored_images()
+                            st.experimental_rerun()
+    
+    # Comparison Analysis Section
+    if st.session_state.selected_images:
+        st.header("Image Comparison Analysis")
+        
+        # Load all selected images
+        image_data_list = [load_image_from_db(img_id) for img_id in st.session_state.selected_images]
+        image_data_list = [img for img in image_data_list if img is not None]
+        
+        if not image_data_list:
+            st.warning("No valid images selected for comparison")
+            return
             
-            # Index selection
-            selected_indices = st.multiselect(
-                "Select Indices to Display",
-                ["NDVI", "GNDVI", "NDWI"],
-                default=[]
-            )
+        # Show original images comparison
+        st.subheader("Original Images")
+        comparison_image, _ = create_comparison_view(image_data_list)
+        if comparison_image:
+            st.image(comparison_image, use_container_width=True)
+        
+        # Show white-balanced comparison
+        st.subheader("White Balance Corrected")
+        for img_data in image_data_list:
+            img_data['array'] = fix_white_balance(img_data['array'])
+        comparison_image, _ = create_comparison_view(image_data_list)
+        if comparison_image:
+            st.image(comparison_image, use_container_width=True)
+        
+        # Index selection and comparison
+        selected_indices = st.multiselect(
+            "Select Indices to Compare",
+            ["NDVI", "GNDVI", "NDWI"],
+            default=[]
+        )
+        
+        # Process selected indices
+        for index_type in selected_indices:
+            st.subheader(f"{index_type} Comparison")
+            comparison_image, stats = create_comparison_view(image_data_list, index_type)
+            if comparison_image:
+                st.image(comparison_image, use_container_width=True)
             
-            # Display images and statistics
-            st.subheader("Original")
-            st.image(image_data['original'], use_container_width=True)
-            
-            st.subheader("White Balance Corrected")
-            st.image(Image.fromarray(corrected_array), use_container_width=True)
-            
-            # Prepare download content
-            download_content = None
-            download_filename = None
-            download_mime = None
-            
-            # Process selected indices
-            for index_type in selected_indices:
-                st.subheader(index_type)
-                
-                # Calculate index
-                index_array = calculate_index(corrected_array, index_type)
-                
-                # Create visualization
-                index_viz = create_index_visualization(index_array, index_type)
-                st.image(index_viz, use_container_width=True)
-                
-                # Analyze index
-                stats = analyze_index(index_array, index_type)
-                
-                # Display statistics
+            # Display statistics in columns
+            if stats:
                 st.write(f"{index_type} Statistics")
-                for key, value in stats.items():
-                    st.metric(key, f"{value:.3f}")
-            
-            # Prepare download content
-            if selected_indices:
-                download_content = download_processed_images(image_data, corrected_array, selected_indices)
-                download_filename = f"processed_images_{image_data['metadata']['filename']}.zip"
-                download_mime = "application/zip"
-            else:
-                # Convert corrected array to image
-                corrected_img = Image.fromarray(corrected_array)
-                buffer = io.BytesIO()
-                corrected_img.save(buffer, format='PNG')
-                download_content = buffer.getvalue()
-                download_filename = f"white_balanced_{image_data['metadata']['filename']}.png"
-                download_mime = "image/png"
-            
-            # Download button
+                cols = st.columns(len(stats))
+                for idx, (filename, img_stats) in enumerate(stats.items()):
+                    with cols[idx]:
+                        st.write(f"**{filename}**")
+                        for key, value in img_stats.items():
+                            st.metric(key, f"{value:.3f}")
+        
+        # Download option
+        if selected_indices:
             st.download_button(
-                label="Download Processed Images",
-                data=download_content,
-                file_name=download_filename,
-                mime=download_mime
+                label="Download Comparison Report",
+                data=download_processed_images(image_data_list[0], image_data_list[0]['array'], selected_indices),
+                file_name="comparison_report.zip",
+                mime="application/zip"
             )
 
 if __name__ == "__main__":
