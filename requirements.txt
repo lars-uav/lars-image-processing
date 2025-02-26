@@ -6,4 +6,3 @@ pymongo
 python-dotenv
 dnspython
 pymongo[srv]
-opencv-python

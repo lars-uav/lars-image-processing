@@ -12,7 +12,6 @@ import os
 from dotenv import load_dotenv
 import hashlib
 import pandas as pd
-import cv2
 from skimage.registration import phase_cross_correlation
 from scipy import ndimage
 
@@ -527,14 +526,18 @@ def align_images(fixed_img, moving_img):
     Returns:
         numpy.ndarray: Aligned version of moving_img
     """
+    from skimage.registration import phase_cross_correlation
+    from scipy import ndimage
+    from skimage.color import rgb2gray
+    
     # Convert to grayscale for registration
     if fixed_img.ndim == 3:
-        fixed_gray = cv2.cvtColor(fixed_img, cv2.COLOR_RGB2GRAY)
+        fixed_gray = rgb2gray(fixed_img)
     else:
         fixed_gray = fixed_img
         
     if moving_img.ndim == 3:
-        moving_gray = cv2.cvtColor(moving_img, cv2.COLOR_RGB2GRAY)
+        moving_gray = rgb2gray(moving_img)
     else:
         moving_gray = moving_img
     
