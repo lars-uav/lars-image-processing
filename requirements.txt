@@ -6,3 +6,4 @@ pymongo
 python-dotenv
 dnspython
 pymongo[srv]
+scikit-image
