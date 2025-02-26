@@ -14,6 +14,7 @@ import hashlib
 import pandas as pd
 from skimage.registration import phase_cross_correlation
 from scipy import ndimage
+from skimage.color import rgb2gray
 
 # Load environment variables
 load_dotenv()
@@ -526,10 +527,6 @@ def align_images(fixed_img, moving_img):
     Returns:
         numpy.ndarray: Aligned version of moving_img
     """
-    from skimage.registration import phase_cross_correlation
-    from scipy import ndimage
-    from skimage.color import rgb2gray
-    
     # Convert to grayscale for registration
     if fixed_img.ndim == 3:
         fixed_gray = rgb2gray(fixed_img)
@@ -543,6 +540,12 @@ def align_images(fixed_img, moving_img):
     
     # Calculate shift using phase correlation
     shift, error, diffphase = phase_cross_correlation(fixed_gray, moving_gray)
+    
+    # If the input is RGB but the correlation was done on grayscale,
+    # we need to extend the shift vector for all dimensions
+    if moving_img.ndim == 3 and len(shift) == 2:
+        # For RGB images, extend the shift to include 0 shift for color channels
+        shift = np.append(shift, 0)
     
     # Apply shift to moving image
     aligned_img = ndimage.shift(moving_img, shift, order=3, mode='reflect')
