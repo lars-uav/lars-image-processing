@@ -4,7 +4,6 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import io
 from datetime import datetime
-import json
 from pymongo import MongoClient
 from bson.binary import Binary
 from bson.objectid import ObjectId
@@ -15,6 +14,9 @@ import pandas as pd
 from skimage.registration import phase_cross_correlation
 from scipy import ndimage
 from skimage.color import rgb2gray
+import zipfile
+import io
+
 
 # Load environment variables
 load_dotenv()
@@ -331,8 +333,6 @@ def download_processed_images(image_data, corrected_array, selected_indices):
     Returns:
         bytes: Zip file content containing processed images
     """
-    import zipfile
-    import io
     
     # Create a bytes IO object for the zip file
     zip_buffer = io.BytesIO()
