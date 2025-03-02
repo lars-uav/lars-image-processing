@@ -15,8 +15,10 @@ from skimage.registration import phase_cross_correlation
 from scipy import ndimage
 from skimage.color import rgb2gray
 import zipfile
-import io
-
+import psutil
+from concurrent.futures import ThreadPoolExecutor
+import functools
+import time
 
 # Load environment variables
 load_dotenv()
@@ -40,6 +42,42 @@ def init_connection():
     except Exception as e:
         st.error(f"Failed to connect to MongoDB: {str(e)}")
         return None
+
+# Performance monitoring decorator
+def timing_decorator(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        duration = end_time - start_time
+        
+        # Only display timing for operations that take longer than 100ms
+        if duration > 0.1:
+            func_name = func.__name__
+            if 'timing_stats' not in st.session_state:
+                st.session_state.timing_stats = {}
+            
+            st.session_state.timing_stats[func_name] = duration
+        
+        return result
+    return wrapper
+
+# Function to hash numpy arrays for caching
+def hash_array(arr):
+    """Create a hash from an array for caching"""
+    # Use a simple but effective hash based on shape, type, and a sample of values
+    shape_hash = hash(arr.shape)
+    type_hash = hash(str(arr.dtype))
+    
+    # Sample some values from the array to create a content hash
+    # This is faster than hashing the entire array
+    step = max(1, arr.size // 1000)  # Sample at most 1000 values
+    flat_arr = arr.flat
+    sample = [flat_arr[i] for i in range(0, arr.size, step)]
+    content_hash = hash(tuple(sample))
+    
+    return hash((shape_hash, type_hash, content_hash))
 
 def compute_file_hash(file_content):
     """Compute a hash of the file content to detect duplicates"""
@@ -80,6 +118,7 @@ def remove_duplicate_images():
         st.error(f"Failed to remove duplicate images: {str(e)}")
         return 0
 
+@timing_decorator
 def get_stored_images():
     """Retrieve list of stored images from MongoDB"""
     try:
@@ -89,6 +128,7 @@ def get_stored_images():
             
         db = client.rgnir_analyzer
         # Retrieve images sorted by timestamp, most recent first
+        # Only retrieve metadata, not the full image data
         images = list(db.images.find({}, {
             'metadata': 1, 
             '_id': 1
@@ -99,6 +139,55 @@ def get_stored_images():
         st.error(f"Failed to retrieve images: {str(e)}")
         return []
 
+# Generate thumbnail for faster display
+def generate_thumbnail(img):
+    """Generate a small thumbnail version of an image"""
+    MAX_THUMB_SIZE = (300, 300)
+    thumb = img.copy()
+    thumb.thumbnail(MAX_THUMB_SIZE, Image.LANCZOS)
+    
+    # Return as PIL image
+    return thumb
+
+# Optimize image for storage
+def optimize_image_for_db(img):
+    """
+    Resize and compress image if it's too large
+    Returns optimized image bytes and metadata
+    """
+    max_dim = 2048  # Maximum dimension
+    max_size_mb = 8  # Target size in MB
+    
+    # Check dimensions
+    width, height = img.size
+    if width > max_dim or height > max_dim:
+        scale = min(max_dim / width, max_dim / height)
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        img = img.resize((new_width, new_height), Image.LANCZOS)
+    
+    # Try different compression levels
+    quality = 95
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=quality, optimize=True)
+    file_size = buffer.getbuffer().nbytes / (1024 * 1024)  # Size in MB
+    
+    # Keep reducing quality until size is acceptable or quality is too low
+    while file_size > max_size_mb and quality > 70:
+        quality -= 5
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=quality, optimize=True)
+        file_size = buffer.getbuffer().nbytes / (1024 * 1024)
+    
+    buffer.seek(0)
+    return buffer.getvalue(), {
+        'width': img.width,
+        'height': img.height,
+        'compression_quality': quality,
+        'file_size_mb': file_size
+    }
+
+@timing_decorator
 def save_image_to_db(uploaded_file):
     """Save image and metadata to MongoDB, preventing duplicates"""
     try:
@@ -106,9 +195,8 @@ def save_image_to_db(uploaded_file):
         file_content = uploaded_file.getvalue()
         file_size = len(file_content) / (1024 * 1024)  # Size in MB
         if file_size > 16:
-            st.error(f"File size ({file_size:.1f}MB) exceeds MongoDB document limit (16MB). Please resize the image before uploading.")
-            return None
-
+            st.error(f"File size ({file_size:.1f}MB) exceeds MongoDB document limit (16MB). Processing with optimization...")
+        
         client = init_connection()
         if not client:
             return None
@@ -127,31 +215,66 @@ def save_image_to_db(uploaded_file):
         try:
             # Verify image can be opened
             img = Image.open(io.BytesIO(file_content))
+            
+            # Generate thumbnail for faster display
+            thumbnail = generate_thumbnail(img)
+            thumbnail_buffer = io.BytesIO()
+            thumbnail.save(thumbnail_buffer, format="JPEG", quality=90)
+            thumbnail_data = thumbnail_buffer.getvalue()
+            
+            # Optimize image if needed
+            if file_size > 8:  # If over 8MB, optimize
+                optimized_data, optimization_meta = optimize_image_for_db(img)
+                # Use optimized image
+                image_data = optimized_data
+                was_optimized = True
+                optimization_info = optimization_meta
+            else:
+                # Use original image data
+                image_data = file_content
+                was_optimized = False
+                optimization_info = {}
+            
+            # Create document
+            document = {
+                'metadata': {
+                    'filename': uploaded_file.name,
+                    'upload_date': datetime.now(),
+                    'file_size_mb': file_size,
+                    'image_dimensions': img.size,
+                    'file_hash': file_hash,
+                    'was_optimized': was_optimized,
+                    'optimization_info': optimization_info
+                },
+                'image_data': Binary(image_data),
+                'thumbnail': Binary(thumbnail_data)
+            }
+            
+            # Insert into MongoDB
+            try:
+                result = db.images.insert_one(document)
+                # Clear cache to ensure fresh data
+                if 'image_cache' in st.session_state:
+                    st.session_state.image_cache = {}
+                return str(result.inserted_id)
+            except Exception as e:
+                if "document too large" in str(e).lower():
+                    # If still too large, try more aggressive optimization
+                    if was_optimized:
+                        st.error(f"File size is still too large even after optimization. Please resize manually.")
+                    else:
+                        optimized_data, optimization_meta = optimize_image_for_db(img)
+                        document['image_data'] = Binary(optimized_data)
+                        document['metadata']['was_optimized'] = True
+                        document['metadata']['optimization_info'] = optimization_meta
+                        result = db.images.insert_one(document)
+                        return str(result.inserted_id)
+                else:
+                    st.error(f"Database error: {str(e)}")
+                return None
+                
         except Exception as e:
             st.error(f"Invalid image file: {str(e)}")
-            return None
-            
-        # Create document
-        document = {
-            'metadata': {
-                'filename': uploaded_file.name,
-                'upload_date': datetime.now(),
-                'file_size_mb': file_size,
-                'image_dimensions': img.size,
-                'file_hash': file_hash  # Store hash to prevent duplicates
-            },
-            'image_data': Binary(file_content)  # Store as binary data
-        }
-        
-        # Insert into MongoDB
-        try:
-            result = db.images.insert_one(document)
-            return str(result.inserted_id)
-        except Exception as e:
-            if "document too large" in str(e).lower():
-                st.error(f"File size ({file_size:.1f}MB) is too large for MongoDB. Please resize the image.")
-            else:
-                st.error(f"Database error: {str(e)}")
             return None
             
     except Exception as e:
@@ -167,13 +290,30 @@ def remove_image_from_db(image_id):
             
         db = client.rgnir_analyzer
         result = db.images.delete_one({'_id': ObjectId(image_id)})
+        
+        # Clear from cache if present
+        if 'image_cache' in st.session_state and image_id in st.session_state.image_cache:
+            del st.session_state.image_cache[image_id]
+            
         return result.deleted_count > 0
     except Exception as e:
         st.error(f"Failed to remove image: {str(e)}")
         return False
 
+@timing_decorator
 def load_image_from_db(image_id):
-    """Load image data from MongoDB"""
+    """Load image data from MongoDB with caching"""
+    # Check if image is already in session cache
+    if 'image_cache' not in st.session_state:
+        st.session_state.image_cache = {}
+    
+    if 'image_hash_map' not in st.session_state:
+        st.session_state.image_hash_map = {}
+        
+    # Return from cache if available
+    if image_id in st.session_state.image_cache:
+        return st.session_state.image_cache[image_id]
+    
     try:
         client = init_connection()
         if not client:
@@ -185,18 +325,71 @@ def load_image_from_db(image_id):
         if document:
             img_bytes = document['image_data']
             img = Image.open(io.BytesIO(img_bytes))
-            return {
+            
+            # Load thumbnail if available
+            thumbnail = None
+            if 'thumbnail' in document:
+                thumbnail = Image.open(io.BytesIO(document['thumbnail']))
+            
+            # Create array representation
+            img_array = np.array(img)
+            
+            # Save in session state for caching functions
+            array_hash = hash_array(img_array)
+            st.session_state.image_hash_map[array_hash] = img_array
+            
+            result = {
                 'original': img,
-                'array': np.array(img),
+                'array': img_array,
+                'array_hash': array_hash,
+                'thumbnail': thumbnail,
                 'metadata': document['metadata']
             }
+            
+            # Store ObjectId in metadata for convenience
+            result['metadata']['_id'] = image_id
+            
+            # Cache the result
+            st.session_state.image_cache[image_id] = result
+            return result
         return None
     except Exception as e:
         st.error(f"Failed to load image: {str(e)}")
         return None
+
+# Load multiple images in parallel
+def load_multiple_images_parallel(image_ids, max_workers=4):
+    """Load multiple images in parallel using threads"""
+    results = []
     
-def fix_white_balance(img_array):
-    """Apply white balance correction to RGNir image"""
+    def load_single_image(img_id):
+        return load_image_from_db(img_id)
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(load_single_image, img_id) for img_id in image_ids]
+        
+        # Show progress bar
+        progress_bar = st.progress(0)
+        for i, future in enumerate(futures):
+            progress_bar.progress((i + 1) / len(futures))
+            
+        # Collect results    
+        results = [future.result() for future in futures]
+    
+    # Clear progress bar when done
+    progress_bar.empty()
+    
+    return [r for r in results if r is not None]
+
+# Cached version of white balance correction
+@st.cache_data(ttl=3600)
+def fix_white_balance_cached(img_array_hash):
+    """Cached version of white balance correction"""
+    # Convert hash back to array
+    img_array = st.session_state.image_hash_map.get(img_array_hash)
+    if img_array is None:
+        return None
+    
     img_float = img_array.astype(float)
     corrected = np.zeros_like(img_float)
     
@@ -207,8 +400,30 @@ def fix_white_balance(img_array):
     
     return corrected.astype(np.uint8)
 
-def calculate_index(img_array, index_type):
-    """Calculate various vegetation/water indices"""
+# Wrapper for white balance function with caching
+def fix_white_balance(img_array):
+    """Apply white balance correction with caching"""
+    # Check if input is an image data dict with array_hash
+    if isinstance(img_array, dict) and 'array_hash' in img_array:
+        return fix_white_balance_cached(img_array['array_hash'])
+    
+    # For raw arrays, create a hash and store it
+    array_hash = hash_array(img_array)
+    if 'image_hash_map' not in st.session_state:
+        st.session_state.image_hash_map = {}
+    st.session_state.image_hash_map[array_hash] = img_array
+    
+    return fix_white_balance_cached(array_hash)
+
+# Cached version of index calculation
+@st.cache_data(ttl=3600)
+def calculate_index_cached(img_array_hash, index_type):
+    """Cached version of index calculation"""
+    # Convert hash back to array
+    img_array = st.session_state.image_hash_map.get(img_array_hash)
+    if img_array is None:
+        return None
+    
     # Convert to float for calculations
     img_float = img_array.astype(float)
     
@@ -243,6 +458,22 @@ def calculate_index(img_array, index_type):
     
     return np.clip(index, -1, 1)
 
+# Wrapper for calculate_index with caching
+def calculate_index(img_array, index_type):
+    """Calculate vegetation/water indices with caching"""
+    # Check if input is an image data dict with array_hash
+    if isinstance(img_array, dict) and 'array_hash' in img_array:
+        return calculate_index_cached(img_array['array_hash'], index_type)
+    
+    # For raw arrays, create a hash and store it
+    array_hash = hash_array(img_array)
+    if 'image_hash_map' not in st.session_state:
+        st.session_state.image_hash_map = {}
+    st.session_state.image_hash_map[array_hash] = img_array
+    
+    return calculate_index_cached(array_hash, index_type)
+
+@st.cache_data(ttl=3600)
 def create_index_visualization(index_array, index_type):
     """Create colorful visualization of index values"""
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -282,240 +513,7 @@ def analyze_index(index_array, index_type):
     }
     return stats
 
-def create_image_gallery(stored_images):
-    """Create a gallery view of saved images"""
-    if not stored_images:
-        st.info("No images found in the database")
-        return
-    
-    # Limit to 20 most recent images to prevent overwhelming the page
-    stored_images = stored_images[:20]
-    
-    # Create a dynamic number of columns based on image count
-    num_cols = min(4, max(1, len(stored_images)))
-    cols = st.columns(num_cols)
-    
-    for idx, doc in enumerate(stored_images):
-        with cols[idx % num_cols]:
-            # Load image data 
-            image_data = load_image_from_db(doc['_id'])
-            if image_data:
-                st.image(
-                    image_data['original'],
-                    caption=image_data['metadata']['filename'],
-                    use_container_width=True
-                )
-                st.caption(f"Uploaded: {image_data['metadata']['upload_date'].strftime('%Y-%m-%d %H:%M:%S')}")
-                
-                # Create columns for Analyze and Remove buttons
-                button_cols = st.columns(2)
-                with button_cols[0]:
-                    if st.button(f"Analyze_{str(doc['_id'])}"):
-                        st.session_state.selected_image = str(doc['_id'])
-                
-                with button_cols[1]:
-                    if st.button(f"Remove_{str(doc['_id'])}", type="secondary"):
-                        if remove_image_from_db(str(doc['_id'])):
-                            st.success("Image removed successfully")
-                            # Update stored_images in session state before rerun
-                            st.session_state.stored_images = get_stored_images()
-                            st.experimental_rerun()
-
-def download_processed_images(image_data, corrected_array, selected_indices):
-    """
-    Create a zip file of processed images for download.
-    
-    Args:
-        image_data (dict): Original image data from database
-        corrected_array (numpy.ndarray): White-balanced image array
-        selected_indices (list): List of selected vegetation/water indices
-    
-    Returns:
-        bytes: Zip file content containing processed images
-    """
-    
-    # Create a bytes IO object for the zip file
-    zip_buffer = io.BytesIO()
-    
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        # Save white balance corrected image
-        corrected_img = Image.fromarray(corrected_array)
-        corrected_buffer = io.BytesIO()
-        corrected_img.save(corrected_buffer, format='PNG')
-        zipf.writestr('white_balanced.png', corrected_buffer.getvalue())
-        
-        # Save index visualizations
-        for index_type in selected_indices:
-            index_array = calculate_index(corrected_array, index_type)
-            index_viz = create_index_visualization(index_array, index_type)
-            index_buffer = io.BytesIO()
-            index_viz.save(index_buffer, format='PNG')
-            zipf.writestr(f'{index_type}_visualization.png', index_buffer.getvalue())
-    
-    # Reset buffer position
-    zip_buffer.seek(0)
-    return zip_buffer.getvalue()
-
-def create_comparison_view(image_data_list, index_type=None):
-    """Create a side-by-side comparison view of multiple images
-    
-    Args:
-        image_data_list (list): List of image data dictionaries
-        index_type (str, optional): Type of index to compare (NDVI, GNDVI, NDWI)
-        
-    Returns:
-        tuple: Combined figure and statistics dictionary
-    """
-    import matplotlib.pyplot as plt
-    import numpy as np
-    from PIL import Image
-    
-    n_images = len(image_data_list)
-    if n_images == 0:
-        return None, {}
-        
-    # Create figure with subplots
-    fig, axes = plt.subplots(1, n_images, figsize=(5*n_images, 4))
-    if n_images == 1:
-        axes = [axes]
-    
-    all_stats = {}
-    
-    for idx, (ax, image_data) in enumerate(zip(axes, image_data_list)):
-        # Get image data
-        if index_type:
-            # Calculate vegetation/water index
-            corrected_array = fix_white_balance(image_data['array'])
-            index_array = calculate_index(corrected_array, index_type)
-            
-            # Create visualization
-            if index_type == "NDWI":
-                cmap = 'RdYlBu'
-            else:
-                cmap = 'RdYlGn'
-            
-            im = ax.imshow(index_array, cmap=cmap, vmin=-1, vmax=1)
-            plt.colorbar(im, ax=ax, label=index_type)
-            
-            # Calculate statistics
-            stats = analyze_index(index_array, index_type)
-            all_stats[image_data['metadata']['filename']] = stats
-        else:
-            # Show original or white-balanced image
-            corrected_array = fix_white_balance(image_data['array'])
-            ax.imshow(corrected_array)
-        
-        # Set title with filename
-        ax.set_title(image_data['metadata']['filename'], fontsize=8)
-        ax.axis('off')
-    
-    plt.tight_layout()
-    
-    # Convert plot to image
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1, dpi=150)
-    plt.close()
-    buf.seek(0)
-    comparison_image = Image.open(buf)
-    
-    return comparison_image, all_stats
-
-# Time Series Monitoring Functions
-def create_monitoring_site(site_name, description=None, coordinates=None):
-    """Create a new monitoring site in the database"""
-    try:
-        client = init_connection()
-        if not client:
-            return None
-            
-        db = client.rgnir_analyzer
-        
-        # Check if site already exists
-        existing_site = db.monitoring_sites.find_one({'name': site_name})
-        if existing_site:
-            st.warning(f"Site '{site_name}' already exists.")
-            return str(existing_site['_id'])
-        
-        # Create site document
-        site_document = {
-            'name': site_name,
-            'description': description,
-            'coordinates': coordinates,
-            'created_date': datetime.now(),
-            'last_updated': datetime.now()
-        }
-        
-        result = db.monitoring_sites.insert_one(site_document)
-        return str(result.inserted_id)
-    
-    except Exception as e:
-        st.error(f"Failed to create monitoring site: {str(e)}")
-        return None
-
-def get_all_monitoring_sites():
-    """Retrieve all monitoring sites from the database"""
-    try:
-        client = init_connection()
-        if not client:
-            return []
-            
-        db = client.rgnir_analyzer
-        sites = list(db.monitoring_sites.find().sort('name', 1))
-        return sites
-    
-    except Exception as e:
-        st.error(f"Failed to retrieve monitoring sites: {str(e)}")
-        return []
-
-def assign_image_to_site(image_id, site_id):
-    """Associate an image with a monitoring site"""
-    try:
-        client = init_connection()
-        if not client:
-            return False
-            
-        db = client.rgnir_analyzer
-        
-        # Update the image document to include site reference
-        result = db.images.update_one(
-            {'_id': ObjectId(image_id)},
-            {'$set': {
-                'metadata.site_id': site_id,
-                'metadata.assigned_to_site_date': datetime.now()
-            }}
-        )
-        
-        # Update the site's last_updated field
-        db.monitoring_sites.update_one(
-            {'_id': ObjectId(site_id)},
-            {'$set': {'last_updated': datetime.now()}}
-        )
-        
-        return result.modified_count > 0
-    
-    except Exception as e:
-        st.error(f"Failed to assign image to site: {str(e)}")
-        return False
-
-def get_site_images(site_id):
-    """Retrieve all images associated with a specific monitoring site"""
-    try:
-        client = init_connection()
-        if not client:
-            return []
-            
-        db = client.rgnir_analyzer
-        images = list(db.images.find(
-            {'metadata.site_id': site_id},
-            {'metadata': 1, '_id': 1}
-        ).sort('metadata.upload_date', 1))  # Sort by date, oldest first
-        
-        return images
-    
-    except Exception as e:
-        st.error(f"Failed to retrieve site images: {str(e)}")
-        return []
-
+@timing_decorator
 def align_images(fixed_img, moving_img):
     """
     Align moving image to fixed image using phase correlation
@@ -552,6 +550,294 @@ def align_images(fixed_img, moving_img):
     
     return aligned_img, shift
 
+# Create paginated image gallery for better performance
+def create_paginated_image_gallery(stored_images, page_size=8):
+    """Create a paginated gallery view of saved images"""
+    if not stored_images:
+        st.info("No images found in the database")
+        return
+    
+    # Pagination controls
+    total_pages = (len(stored_images) + page_size - 1) // page_size
+    
+    col1, col2, col3 = st.columns([1, 3, 1])
+    with col1:
+        if 'current_page' not in st.session_state:
+            st.session_state.current_page = 0
+        if st.button("← Previous"):
+            st.session_state.current_page = max(0, st.session_state.current_page - 1)
+    
+    with col2:
+        st.write(f"Page {st.session_state.current_page + 1} of {max(1, total_pages)}")
+    
+    with col3:
+        if st.button("Next →"):
+            st.session_state.current_page = min(total_pages - 1, st.session_state.current_page + 1)
+    
+    # Get current page of images
+    start_idx = st.session_state.current_page * page_size
+    end_idx = min(start_idx + page_size, len(stored_images))
+    current_page_images = stored_images[start_idx:end_idx]
+    
+    # Create a dynamic number of columns based on image count
+    num_cols = min(4, max(1, len(current_page_images)))
+    cols = st.columns(num_cols)
+    
+    # Load images for current page in parallel
+    image_ids = [str(doc['_id']) for doc in current_page_images]
+    
+    with st.spinner("Loading images..."):
+        loaded_images = load_multiple_images_parallel(image_ids)
+    
+    # Create mapping of IDs to loaded images
+    image_map = {img['metadata']['_id']: img for img in loaded_images if img is not None}
+    
+    for idx, doc in enumerate(current_page_images):
+        with cols[idx % num_cols]:
+            image_id = str(doc['_id'])
+            image_data = image_map.get(image_id)
+            if image_data:
+                # Display thumbnail if available, otherwise original
+                display_img = image_data.get('thumbnail', image_data['original'])
+                st.image(
+                    display_img,
+                    caption=image_data['metadata']['filename'],
+                    use_container_width=True
+                )
+                st.caption(f"Uploaded: {image_data['metadata']['upload_date'].strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                # Create columns for buttons
+                button_cols = st.columns(2)
+                with button_cols[0]:
+                    # Use key parameter to ensure unique keys
+                    if st.button(f"Analyze", key=f"analyze_{image_id}"):
+                        st.session_state.selected_image = image_id
+                        
+                with button_cols[1]:
+                    if st.button(f"Remove", key=f"remove_{image_id}", type="secondary"):
+                        if remove_image_from_db(image_id):
+                            st.success("Image removed successfully")
+                            # Update stored_images in session state before rerun
+                            st.session_state.stored_images = get_stored_images()
+                            st.experimental_rerun()
+
+@timing_decorator
+def create_comparison_view(image_data_list, index_type=None):
+    """Create a side-by-side comparison view of multiple images with optimization"""
+    n_images = len(image_data_list)
+    if n_images == 0:
+        return None, {}
+        
+    # Create figure with subplots
+    fig, axes = plt.subplots(1, n_images, figsize=(5*n_images, 4))
+    if n_images == 1:
+        axes = [axes]
+    
+    all_stats = {}
+    
+    for idx, (ax, image_data) in enumerate(zip(axes, image_data_list)):
+        # Get image data
+        if index_type:
+            # Calculate vegetation/water index (use cached version)
+            corrected_array = fix_white_balance(image_data)
+            index_array = calculate_index(corrected_array, index_type)
+            
+            # Create visualization
+            if index_type == "NDWI":
+                cmap = 'RdYlBu'
+            else:
+                cmap = 'RdYlGn'
+            
+            im = ax.imshow(index_array, cmap=cmap, vmin=-1, vmax=1)
+            plt.colorbar(im, ax=ax, label=index_type)
+            
+            # Calculate statistics
+            stats = analyze_index(index_array, index_type)
+            all_stats[image_data['metadata']['filename']] = stats
+        else:
+            # Show original or white-balanced image
+            corrected_array = fix_white_balance(image_data)
+            ax.imshow(corrected_array)
+        
+        # Set title with filename
+        ax.set_title(image_data['metadata']['filename'], fontsize=8)
+        ax.axis('off')
+    
+    plt.tight_layout()
+    
+    # Convert plot to image
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1, dpi=150)
+    plt.close()
+    buf.seek(0)
+    comparison_image = Image.open(buf)
+    
+    return comparison_image, all_stats
+
+@timing_decorator
+def download_processed_images(image_data, corrected_array, selected_indices):
+    """
+    Create a zip file of processed images for download.
+    
+    Args:
+        image_data (dict): Original image data from database
+        corrected_array (numpy.ndarray): White-balanced image array
+        selected_indices (list): List of selected vegetation/water indices
+    
+    Returns:
+        bytes: Zip file content containing processed images
+    """
+    
+    # Create a bytes IO object for the zip file
+    zip_buffer = io.BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # Save white balance corrected image
+        corrected_img = Image.fromarray(corrected_array)
+        corrected_buffer = io.BytesIO()
+        corrected_img.save(corrected_buffer, format='PNG')
+        zipf.writestr('white_balanced.png', corrected_buffer.getvalue())
+        
+        # Save index visualizations
+        for index_type in selected_indices:
+            index_array = calculate_index(corrected_array, index_type)
+            index_viz = create_index_visualization(index_array, index_type)
+            index_buffer = io.BytesIO()
+            index_viz.save(index_buffer, format='PNG')
+            zipf.writestr(f'{index_type}_visualization.png', index_buffer.getvalue())
+    
+    # Reset buffer position
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+# Add memory usage monitoring
+def display_performance_metrics():
+    """Add memory usage and timing information to sidebar"""
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    
+    memory_usage_mb = memory_info.rss / (1024 * 1024)  # Convert to MB
+    
+    st.sidebar.header("Performance Metrics")
+    st.sidebar.metric("Memory Usage", f"{memory_usage_mb:.1f} MB")
+    
+    # Display timing statistics if available
+    if 'timing_stats' in st.session_state and st.session_state.timing_stats:
+        st.sidebar.subheader("Operation Timings")
+        for operation, duration in st.session_state.timing_stats.items():
+            st.sidebar.metric(operation, f"{duration:.2f} sec")
+    
+    # Add clear cache button
+    if st.sidebar.button("Clear Memory Cache"):
+        if 'image_cache' in st.session_state:
+            st.session_state.image_cache = {}
+        if 'image_hash_map' in st.session_state:
+            st.session_state.image_hash_map = {}
+        st.cache_data.clear()
+        st.success("Cache cleared successfully")
+        st.experimental_rerun()
+
+# Time Series Monitoring Functions
+@timing_decorator
+def create_monitoring_site(site_name, description=None, coordinates=None):
+    """Create a new monitoring site in the database"""
+    try:
+        client = init_connection()
+        if not client:
+            return None
+            
+        db = client.rgnir_analyzer
+        
+        # Check if site already exists
+        existing_site = db.monitoring_sites.find_one({'name': site_name})
+        if existing_site:
+            st.warning(f"Site '{site_name}' already exists.")
+            return str(existing_site['_id'])
+        
+        # Create site document
+        site_document = {
+            'name': site_name,
+            'description': description,
+            'coordinates': coordinates,
+            'created_date': datetime.now(),
+            'last_updated': datetime.now()
+        }
+        
+        result = db.monitoring_sites.insert_one(site_document)
+        return str(result.inserted_id)
+    
+    except Exception as e:
+        st.error(f"Failed to create monitoring site: {str(e)}")
+        return None
+
+@timing_decorator
+def get_all_monitoring_sites():
+    """Retrieve all monitoring sites from the database"""
+    try:
+        client = init_connection()
+        if not client:
+            return []
+            
+        db = client.rgnir_analyzer
+        sites = list(db.monitoring_sites.find().sort('name', 1))
+        return sites
+    
+    except Exception as e:
+        st.error(f"Failed to retrieve monitoring sites: {str(e)}")
+        return []
+
+@timing_decorator
+def assign_image_to_site(image_id, site_id):
+    """Associate an image with a monitoring site"""
+    try:
+        client = init_connection()
+        if not client:
+            return False
+            
+        db = client.rgnir_analyzer
+        
+        # Update the image document to include site reference
+        result = db.images.update_one(
+            {'_id': ObjectId(image_id)},
+            {'$set': {
+                'metadata.site_id': site_id,
+                'metadata.assigned_to_site_date': datetime.now()
+            }}
+        )
+        
+        # Update the site's last_updated field
+        db.monitoring_sites.update_one(
+            {'_id': ObjectId(site_id)},
+            {'$set': {'last_updated': datetime.now()}}
+        )
+        
+        return result.modified_count > 0
+    
+    except Exception as e:
+        st.error(f"Failed to assign image to site: {str(e)}")
+        return False
+
+@timing_decorator
+def get_site_images(site_id):
+    """Retrieve all images associated with a specific monitoring site"""
+    try:
+        client = init_connection()
+        if not client:
+            return []
+            
+        db = client.rgnir_analyzer
+        images = list(db.images.find(
+            {'metadata.site_id': site_id},
+            {'metadata': 1, '_id': 1}
+        ).sort('metadata.upload_date', 1))  # Sort by date, oldest first
+        
+        return images
+    
+    except Exception as e:
+        st.error(f"Failed to retrieve site images: {str(e)}")
+        return []
+
+@st.cache_data(ttl=3600)
 def create_time_series_plot(image_data_list, index_type):
     """
     Create a time series plot of a vegetation/water index for multiple dates
@@ -575,8 +861,8 @@ def create_time_series_plot(image_data_list, index_type):
         date = img_data['metadata']['upload_date']
         dates.append(date)
         
-        # Calculate index
-        corrected_array = fix_white_balance(img_data['array'])
+        # Calculate index (use cached version)
+        corrected_array = fix_white_balance(img_data)
         index_array = calculate_index(corrected_array, index_type)
         
         # Calculate statistics
@@ -615,6 +901,7 @@ def create_time_series_plot(image_data_list, index_type):
     buf.seek(0)
     return Image.open(buf)
 
+@st.cache_data(ttl=3600)
 def create_change_detection_visualization(image_pair, index_type):
     """
     Create visualization showing changes between two dates
@@ -628,9 +915,9 @@ def create_change_detection_visualization(image_pair, index_type):
     """
     early_img_data, late_img_data = image_pair
     
-    # Calculate indices for both images
-    early_corrected = fix_white_balance(early_img_data['array'])
-    late_corrected = fix_white_balance(late_img_data['array'])
+    # Calculate indices for both images (use cached versions)
+    early_corrected = fix_white_balance(early_img_data)
+    late_corrected = fix_white_balance(late_img_data)
     
     # Try to align images first
     aligned_late, shift = align_images(early_corrected, late_corrected)
@@ -677,6 +964,7 @@ def create_change_detection_visualization(image_pair, index_type):
     buf.seek(0)
     return Image.open(buf)
 
+@timing_decorator
 def calculate_index_statistics_by_timeframe(image_data_list, index_type):
     """
     Calculate index statistics for each image in the time series
@@ -695,8 +983,8 @@ def calculate_index_statistics_by_timeframe(image_data_list, index_type):
         # Get date from metadata
         date = img_data['metadata']['upload_date']
         
-        # Calculate index
-        corrected_array = fix_white_balance(img_data['array'])
+        # Calculate index (use cached version)
+        corrected_array = fix_white_balance(img_data)
         index_array = calculate_index(corrected_array, index_type)
         
         # Calculate statistics
@@ -718,7 +1006,7 @@ def calculate_index_statistics_by_timeframe(image_data_list, index_type):
     df = pd.DataFrame(results)
     return df
 
-# UI function for time series analysis
+@timing_decorator
 def time_series_analysis_ui():
     """UI for time series analysis of monitoring sites"""
     st.header("Time Series Monitoring")
@@ -749,14 +1037,19 @@ def time_series_analysis_ui():
                     st.error("Site name is required")
                 else:
                     coordinates = {"lat": lat, "lng": lng} if include_coords else None
-                    site_id = create_monitoring_site(site_name, site_desc, coordinates)
+                    with st.spinner("Creating site..."):
+                        site_id = create_monitoring_site(site_name, site_desc, coordinates)
                     if site_id:
                         st.success(f"Site '{site_name}' created successfully!")
                         # Force refresh the site list
                         st.session_state.monitoring_sites = get_all_monitoring_sites()
         
         # Display available sites
-        monitoring_sites = get_all_monitoring_sites()
+        monitoring_sites = st.session_state.get('monitoring_sites', [])
+        if not monitoring_sites:
+            monitoring_sites = get_all_monitoring_sites()
+            st.session_state.monitoring_sites = monitoring_sites
+            
         if not monitoring_sites:
             st.info("No monitoring sites found. Create one to get started.")
         else:
@@ -804,7 +1097,7 @@ def time_series_analysis_ui():
                     )
                     
                     if selected_images and st.button("Assign to Site"):
-                        with st.spinner("Assigning images..."):
+                        with st.spinner(f"Assigning {len(selected_images)} images..."):
                             success_count = 0
                             for img_id in selected_images:
                                 if assign_image_to_site(img_id, str(selected_site['_id'])):
@@ -822,10 +1115,10 @@ def time_series_analysis_ui():
                 # Load image data for all site images
                 image_data_list = []
                 with st.spinner("Loading site images..."):
-                    for img in site_images:
-                        img_data = load_image_from_db(img['_id'])
-                        if img_data:
-                            image_data_list.append(img_data)
+                    # Load images in parallel
+                    image_ids = [str(img['_id']) for img in site_images]
+                    loaded_images = load_multiple_images_parallel(image_ids)
+                    image_data_list = loaded_images
                 
                 # Select index for analysis
                 index_type = st.selectbox(
@@ -840,12 +1133,14 @@ def time_series_analysis_ui():
                 else:
                     # Time series plot
                     st.subheader(f"{index_type} Time Series")
-                    ts_plot = create_time_series_plot(image_data_list, index_type)
+                    with st.spinner("Generating time series plot..."):
+                        ts_plot = create_time_series_plot(image_data_list, index_type)
                     st.image(ts_plot, use_container_width=True)
                     
                     # Statistics table
                     st.subheader("Statistics Over Time")
-                    stats_df = calculate_index_statistics_by_timeframe(image_data_list, index_type)
+                    with st.spinner("Calculating statistics..."):
+                        stats_df = calculate_index_statistics_by_timeframe(image_data_list, index_type)
                     st.dataframe(stats_df)
                     
                     # Change detection - compare first and last images
@@ -854,10 +1149,11 @@ def time_series_analysis_ui():
                         first_img = image_data_list[0]
                         last_img = image_data_list[-1]
                         
-                        change_viz = create_change_detection_visualization(
-                            (first_img, last_img), 
-                            index_type
-                        )
+                        with st.spinner("Generating change detection visualization..."):
+                            change_viz = create_change_detection_visualization(
+                                (first_img, last_img), 
+                                index_type
+                            )
                         st.image(change_viz, use_container_width=True)
                         
                         # Add download button for change detection report
@@ -877,27 +1173,36 @@ def time_series_analysis_ui():
                         )
 
 def main():
-    """Main function with time series monitoring enhancement"""
+    """Main function with performance optimizations and time series monitoring"""
     st.set_page_config(layout="wide", page_title="RGNir Image Analyzer")
+    
+    # Initialize MongoDB connection
+    if not init_connection():
+        st.error("Failed to connect to database. Please check your connection settings.")
+        return
+    
+    # Display performance monitoring in sidebar
+    display_performance_metrics()
     
     # Create tabs for different functionality
     tab1, tab2 = st.tabs(["Image Analysis", "Time Series Monitoring"])
     
+    # Initialize session state
+    if 'selected_images' not in st.session_state:
+        st.session_state.selected_images = []
+    if 'stored_images' not in st.session_state:
+        st.session_state.stored_images = get_stored_images()
+    if 'monitoring_sites' not in st.session_state:
+        st.session_state.monitoring_sites = get_all_monitoring_sites()
+    if 'image_cache' not in st.session_state:
+        st.session_state.image_cache = {}
+    if 'image_hash_map' not in st.session_state:
+        st.session_state.image_hash_map = {}
+    if 'timing_stats' not in st.session_state:
+        st.session_state.timing_stats = {}
+    
     with tab1:
         st.title("RGNir Image Analyzer")
-        
-        # Initialize MongoDB connection
-        if not init_connection():
-            st.error("Failed to connect to database. Please check your connection settings.")
-            return
-        
-        # Initialize session state
-        if 'selected_images' not in st.session_state:
-            st.session_state.selected_images = []
-        if 'stored_images' not in st.session_state:
-            st.session_state.stored_images = get_stored_images()
-        if 'monitoring_sites' not in st.session_state:
-            st.session_state.monitoring_sites = get_all_monitoring_sites()
         
         # File uploader section
         uploaded_files = st.file_uploader(
@@ -910,155 +1215,144 @@ def main():
         # Process uploaded files
         if uploaded_files:
             uploaded_hashes = set()
-            with st.spinner("Processing uploaded images..."):
-                for uploaded_file in uploaded_files:
-                    file_hash = compute_file_hash(uploaded_file.getvalue())
-                    if file_hash in uploaded_hashes:
-                        st.warning(f"Skipping duplicate image: {uploaded_file.name}")
-                        continue
-                    uploaded_hashes.add(file_hash)
-                    if save_image_to_db(uploaded_file):
-                        st.success(f"Successfully uploaded {uploaded_file.name}")
-                        st.session_state.stored_images = get_stored_images()
+            progress_bar = st.progress(0)
+            for i, uploaded_file in enumerate(uploaded_files):
+                # Update progress
+                progress = (i + 1) / len(uploaded_files)
+                progress_bar.progress(progress)
+                
+                # Process file
+                file_hash = compute_file_hash(uploaded_file.getvalue())
+                if file_hash in uploaded_hashes:
+                    st.warning(f"Skipping duplicate image: {uploaded_file.name}")
+                    continue
+                uploaded_hashes.add(file_hash)
+                if save_image_to_db(uploaded_file):
+                    st.success(f"Successfully uploaded {uploaded_file.name}")
+                    
+            # Clear progress bar and refresh image list
+            progress_bar.empty()
+            st.session_state.stored_images = get_stored_images()
         
         # Database Management section
         with st.expander("Database Management"):
             st.write("Database Maintenance Tools")
             
             if st.button("Remove Duplicate Images"):
-                removed_count = remove_duplicate_images()
+                with st.spinner("Checking for duplicates..."):
+                    removed_count = remove_duplicate_images()
                 if removed_count > 0:
                     st.success(f"Removed {removed_count} duplicate images")
                     st.session_state.stored_images = get_stored_images()
                 else:
                     st.info("No duplicate images found")
             
+            # Two-step deletion process
             if st.button("Clear All Images", type="secondary"):
-                if st.button("Confirm Delete All Images?", type="primary"):
-                    try:
-                        client = init_connection()
-                        if client:
-                            db = client.rgnir_analyzer
-                            db.images.delete_many({})
-                            st.success("All images removed successfully")
-                            st.session_state.stored_images = get_stored_images()
-                            st.experimental_rerun()
-                    except Exception as e:
-                        st.error(f"Failed to clear database: {str(e)}")
+                st.warning("⚠️ This will delete ALL images from the database!")
+                confirm = st.checkbox("I understand the consequences")
+                if confirm and st.button("Confirm Delete All Images", type="primary"):
+                    with st.spinner("Deleting all images..."):
+                        try:
+                            client = init_connection()
+                            if client:
+                                db = client.rgnir_analyzer
+                                result = db.images.delete_many({})
+                                st.success(f"All images removed successfully ({result.deleted_count} images)")
+                                # Clear caches
+                                st.session_state.image_cache = {}
+                                st.session_state.image_hash_map = {}
+                                st.session_state.stored_images = []
+                                st.session_state.selected_images = []
+                                st.cache_data.clear()
+                        except Exception as e:
+                            st.error(f"Failed to clear database: {str(e)}")
         
         # Refresh Database Button
         if st.button("Refresh Database", key="refresh_button_unique"):
-            st.session_state.stored_images = get_stored_images()
+            with st.spinner("Refreshing image list..."):
+                st.session_state.stored_images = get_stored_images()
+            st.success("Database refreshed")
         
-        # Gallery Section with Multi-select
+        # Gallery Section with pagination
         st.header("Image Gallery")
         if not st.session_state.stored_images:
             st.info("No images found in the database")
         else:
-            # Create columns for gallery
-            num_cols = min(4, max(1, len(st.session_state.stored_images)))
-            cols = st.columns(num_cols)
-            
-            for idx, doc in enumerate(st.session_state.stored_images[:20]):
-                with cols[idx % num_cols]:
-                    image_data = load_image_from_db(doc['_id'])
-                    if image_data:
-                        st.image(
-                            image_data['original'],
-                            caption=image_data['metadata']['filename'],
-                            use_container_width=True
-                        )
-                        st.caption(f"Uploaded: {image_data['metadata']['upload_date'].strftime('%Y-%m-%d %H:%M:%S')}")
-                        
-                        # Add checkbox for selection
-                        if st.checkbox(f"Select for comparison {str(doc['_id'])}", 
-                                     value=str(doc['_id']) in st.session_state.selected_images):
-                            if str(doc['_id']) not in st.session_state.selected_images:
-                                st.session_state.selected_images.append(str(doc['_id']))
-                        else:
-                            if str(doc['_id']) in st.session_state.selected_images:
-                                st.session_state.selected_images.remove(str(doc['_id']))
-                        
-                        # Remove button
-                        if st.button(f"Remove_{str(doc['_id'])}", type="secondary"):
-                            if remove_image_from_db(str(doc['_id'])):
-                                st.success("Image removed successfully")
-                                if str(doc['_id']) in st.session_state.selected_images:
-                                    st.session_state.selected_images.remove(str(doc['_id']))
-                                st.session_state.stored_images = get_stored_images()
-                                st.experimental_rerun()
+            # Use paginated gallery for better performance
+            create_paginated_image_gallery(st.session_state.stored_images)
         
         # Comparison Analysis Section
         if st.session_state.selected_images:
             st.header("Image Comparison Analysis")
             
-            # Load all selected images
-            image_data_list = [load_image_from_db(img_id) for img_id in st.session_state.selected_images]
-            image_data_list = [img for img in image_data_list if img is not None]
+            # Load all selected images in parallel
+            with st.spinner("Loading selected images..."):
+                image_data_list = load_multiple_images_parallel(st.session_state.selected_images)
             
             if not image_data_list:
                 st.warning("No valid images selected for comparison")
-                return
-                
-            # Show original images comparison
-            st.subheader("Original Images")
-            comparison_image, _ = create_comparison_view(image_data_list)
-            if comparison_image:
-                st.image(comparison_image, use_container_width=True)
-            
-            # Show white-balanced comparison
-            st.subheader("White Balance Corrected")
-            for img_data in image_data_list:
-                img_data['array'] = fix_white_balance(img_data['array'])
-            comparison_image, _ = create_comparison_view(image_data_list)
-            if comparison_image:
-                st.image(comparison_image, use_container_width=True)
-            
-            # Index selection and comparison
-            selected_indices = st.multiselect(
-                "Select Indices to Compare",
-                ["NDVI", "GNDVI", "NDWI"],
-                default=[]
-            )
-            
-            # Process selected indices
-            for index_type in selected_indices:
-                st.subheader(f"{index_type} Comparison")
-                comparison_image, stats = create_comparison_view(image_data_list, index_type)
+            else:
+                # Show original images comparison
+                st.subheader("Original Images")
+                with st.spinner("Creating comparison view..."):
+                    comparison_image, _ = create_comparison_view(image_data_list)
                 if comparison_image:
                     st.image(comparison_image, use_container_width=True)
                 
-                # Display statistics in columns
-                if stats:
-                    st.write(f"{index_type} Statistics")
-                    cols = st.columns(len(stats))
-                    for idx, (filename, img_stats) in enumerate(stats.items()):
-                        with cols[idx]:
-                            st.write(f"**{filename}**")
-                            for key, value in img_stats.items():
-                                st.metric(key, f"{value:.3f}")
-            
-            # Download option
-            if selected_indices:
-                st.download_button(
-                    label="Download Comparison Report",
-                    data=download_processed_images(image_data_list[0], image_data_list[0]['array'], selected_indices),
-                    file_name="comparison_report.zip",
-                    mime="application/zip"
+                # Show white-balanced comparison
+                st.subheader("White Balance Corrected")
+                # Process white balance in parallel for better performance
+                with st.spinner("Applying white balance correction..."):
+                    corrected_data_list = []
+                    for img_data in image_data_list:
+                        # Use cached version
+                        corrected_array = fix_white_balance(img_data)
+                        img_data_copy = img_data.copy()
+                        img_data_copy['array'] = corrected_array
+                        corrected_data_list.append(img_data_copy)
+                    
+                    comparison_image, _ = create_comparison_view(corrected_data_list)
+                
+                if comparison_image:
+                    st.image(comparison_image, use_container_width=True)
+                
+                # Index selection and comparison
+                selected_indices = st.multiselect(
+                    "Select Indices to Compare",
+                    ["NDVI", "GNDVI", "NDWI"],
+                    default=[]
                 )
+                
+                # Process selected indices
+                for index_type in selected_indices:
+                    st.subheader(f"{index_type} Comparison")
+                    with st.spinner(f"Calculating {index_type}..."):
+                        comparison_image, stats = create_comparison_view(corrected_data_list, index_type)
+                    
+                    if comparison_image:
+                        st.image(comparison_image, use_container_width=True)
+                    
+                    # Display statistics in columns
+                    if stats:
+                        st.write(f"{index_type} Statistics")
+                        cols = st.columns(len(stats))
+                        for idx, (filename, img_stats) in enumerate(stats.items()):
+                            with cols[idx]:
+                                st.write(f"**{filename}**")
+                                for key, value in img_stats.items():
+                                    st.metric(key, f"{value:.3f}")
+                
+                # Download option
+                if selected_indices:
+                    st.download_button(
+                        label="Download Comparison Report",
+                        data=download_processed_images(corrected_data_list[0], corrected_data_list[0]['array'], selected_indices),
+                        file_name="comparison_report.zip",
+                        mime="application/zip"
+                    )
     
     with tab2:
-        # Initialize MongoDB connection if not already done
-        if not init_connection():
-            st.error("Failed to connect to database. Please check your connection settings.")
-            return
-            
-        # Make sure session state is initialized
-        if 'stored_images' not in st.session_state:
-            st.session_state.stored_images = get_stored_images()
-        if 'monitoring_sites' not in st.session_state:
-            st.session_state.monitoring_sites = get_all_monitoring_sites()
-            
         # Display time series UI
         time_series_analysis_ui()
 
