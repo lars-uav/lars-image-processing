@@ -19,6 +19,7 @@ import psutil
 from concurrent.futures import ThreadPoolExecutor
 import functools
 import time
+from pymongo import MongoClient, ASCENDING, DESCENDING, TEXT
 
 # Load environment variables
 load_dotenv()
@@ -26,7 +27,7 @@ load_dotenv()
 # MongoDB setup
 @st.cache_resource
 def init_connection():
-    """Initialize MongoDB connection"""
+    """Initialize MongoDB connection and ensure indexes exist"""
     try:
         # For local development, use .env file
         mongodb_uri = os.getenv("MONGODB_URI")
@@ -37,11 +38,84 @@ def init_connection():
         if not mongodb_uri:
             raise ValueError("MongoDB URI not found in environment or secrets")
             
-        client = MongoClient(mongodb_uri)
+        client = MongoClient(
+            mongodb_uri,
+            # Add MongoDB connection optimizations
+            maxPoolSize=10,          # Increase from default of 5
+            maxIdleTimeMS=30000,     # Lower connection idle timeout
+            connectTimeoutMS=5000,   # Connection timeout in milliseconds
+            retryWrites=True,        # Automatically retry writes on failure
+            w='majority',            # Write concerns for consistency
+            appname="RGNir-Analyzer" # For monitoring in MongoDB Atlas
+        )
+        
+        # Ensure we can connect to the database
+        client.admin.command('ping')
+        
+        # Initialize database and ensure indexes
+        ensure_indexes(client)
+        
         return client
     except Exception as e:
         st.error(f"Failed to connect to MongoDB: {str(e)}")
         return None
+    
+def ensure_indexes(client):
+    """Ensure all necessary indexes exist in the database"""
+    try:
+        db = client.rgnir_analyzer
+        
+        # Check if indexes already exist for images collection
+        existing_image_indexes = {idx['name'] for idx in db.images.list_indexes()}
+        
+        # Create necessary indexes for images collection if they don't exist
+        if "idx_file_hash" not in existing_image_indexes:
+            db.images.create_index([("metadata.file_hash", ASCENDING)], 
+                                unique=True, 
+                                name="idx_file_hash",
+                                background=True)
+            
+        if "idx_upload_date" not in existing_image_indexes:
+            db.images.create_index([("metadata.upload_date", DESCENDING)], 
+                                name="idx_upload_date",
+                                background=True)
+            
+        if "idx_site_id" not in existing_image_indexes:
+            db.images.create_index([("metadata.site_id", ASCENDING)], 
+                                name="idx_site_id",
+                                background=True)
+                                
+        if "idx_site_id_upload_date" not in existing_image_indexes:
+            db.images.create_index([
+                ("metadata.site_id", ASCENDING),
+                ("metadata.upload_date", ASCENDING)
+            ], name="idx_site_id_upload_date",
+            background=True)
+            
+        if "idx_filename_text" not in existing_image_indexes:
+            db.images.create_index([("metadata.filename", TEXT)], 
+                                name="idx_filename_text",
+                                background=True)
+        
+        # Check if indexes already exist for monitoring_sites collection
+        existing_site_indexes = {idx['name'] for idx in db.monitoring_sites.list_indexes()}
+        
+        # Create necessary indexes for monitoring_sites collection if they don't exist
+        if "idx_site_name" not in existing_site_indexes:
+            db.monitoring_sites.create_index([("name", ASCENDING)], 
+                                         unique=True, 
+                                         name="idx_site_name",
+                                         background=True)
+            
+        if "idx_last_updated" not in existing_site_indexes:
+            db.monitoring_sites.create_index([("last_updated", DESCENDING)], 
+                                         name="idx_last_updated",
+                                         background=True)
+    
+    except Exception as e:
+        # Log error but don't raise - we want the application to start anyway
+        print(f"Warning: Failed to create indexes: {str(e)}")
+
 
 # Performance monitoring decorator
 def timing_decorator(func):
@@ -118,25 +192,88 @@ def remove_duplicate_images():
         st.error(f"Failed to remove duplicate images: {str(e)}")
         return 0
 
-@timing_decorator
-def get_stored_images():
-    """Retrieve list of stored images from MongoDB"""
+def get_stored_images(page=0, page_size=20, search_term=None):
+    """
+    Retrieve paginated list of stored images from MongoDB with optional search
+    
+    Args:
+        page (int): Page number (0-based)
+        page_size (int): Number of items per page
+        search_term (str, optional): Text to search in filename
+        
+    Returns:
+        tuple: (list of images, total count)
+    """
+    try:
+        client = init_connection()
+        if not client:
+            return [], 0
+            
+        db = client.rgnir_analyzer
+        
+        # Base query
+        query = {}
+        
+        # Add search filter if provided
+        if search_term:
+            query["metadata.filename"] = {"$regex": search_term, "$options": "i"}
+        
+        # Get total count for pagination
+        total_count = db.images.count_documents(query)
+        
+        # Query with pagination
+        images = list(db.images.find(
+            query,
+            {"metadata": 1, "_id": 1}
+        ).sort(
+            "metadata.upload_date", -1
+        ).skip(
+            page * page_size
+        ).limit(
+            page_size
+        ))
+        
+        return images, total_count
+    
+    except Exception as e:
+        st.error(f"Failed to retrieve images: {str(e)}")
+        return [], 0
+    
+def search_images(search_term):
+    """
+    Search for images by filename
+    
+    Args:
+        search_term (str): Text to search in filename
+        
+    Returns:
+        list: Matching images
+    """
     try:
         client = init_connection()
         if not client:
             return []
             
         db = client.rgnir_analyzer
-        # Retrieve images sorted by timestamp, most recent first
-        # Only retrieve metadata, not the full image data
-        images = list(db.images.find({}, {
-            'metadata': 1, 
-            '_id': 1
-        }).sort('metadata.upload_date', -1))
+        
+        # Use text index if search_term is a single word, otherwise use regex
+        if " " not in search_term:
+            # Use text index for single word searches
+            images = list(db.images.find(
+                {"$text": {"$search": search_term}},
+                {"metadata": 1, "_id": 1, "score": {"$meta": "textScore"}}
+            ).sort([("score", {"$meta": "textScore"})]).limit(20))
+        else:
+            # Use regex for multi-word searches
+            images = list(db.images.find(
+                {"metadata.filename": {"$regex": search_term, "$options": "i"}},
+                {"metadata": 1, "_id": 1}
+            ).sort("metadata.upload_date", -1).limit(20))
         
         return images
+    
     except Exception as e:
-        st.error(f"Failed to retrieve images: {str(e)}")
+        st.error(f"Failed to search images: {str(e)}")
         return []
 
 # Generate thumbnail for faster display
@@ -817,19 +954,29 @@ def assign_image_to_site(image_id, site_id):
         st.error(f"Failed to assign image to site: {str(e)}")
         return False
 
-@timing_decorator
-def get_site_images(site_id):
-    """Retrieve all images associated with a specific monitoring site"""
+def get_site_images(site_id, sort_order=1):
+    """
+    Optimized retrieval of all images associated with a specific monitoring site
+    
+    Args:
+        site_id (str): ID of the monitoring site
+        sort_order (int): Sort order, 1 for ascending (oldest first), -1 for descending (newest first)
+        
+    Returns:
+        list: Images associated with the site
+    """
     try:
         client = init_connection()
         if not client:
             return []
             
         db = client.rgnir_analyzer
+        
+        # Use the compound index for this query
         images = list(db.images.find(
-            {'metadata.site_id': site_id},
-            {'metadata': 1, '_id': 1}
-        ).sort('metadata.upload_date', 1))  # Sort by date, oldest first
+            {"metadata.site_id": site_id},
+            {"metadata": 1, "_id": 1}
+        ).sort("metadata.upload_date", sort_order).hint("idx_site_id_upload_date"))
         
         return images
     
