@@ -687,9 +687,9 @@ def align_images(fixed_img, moving_img):
     
     return aligned_img, shift
 
-# Create paginated image gallery for better performance
+# Create paginated image gallery with error handling
 def create_paginated_image_gallery(stored_images, page_size=8):
-    """Create a paginated gallery view of saved images"""
+    """Create a paginated gallery view of saved images with improved error handling"""
     if not stored_images:
         st.info("No images found in the database")
         return
@@ -716,47 +716,92 @@ def create_paginated_image_gallery(stored_images, page_size=8):
     end_idx = min(start_idx + page_size, len(stored_images))
     current_page_images = stored_images[start_idx:end_idx]
     
+    # Debug information
+    st.write(f"Showing images {start_idx+1}-{end_idx} of {len(stored_images)}")
+    
     # Create a dynamic number of columns based on image count
     num_cols = min(4, max(1, len(current_page_images)))
     cols = st.columns(num_cols)
     
-    # Load images for current page in parallel
-    image_ids = [str(doc['_id']) for doc in current_page_images]
+    # Safety check for document structure and extract image IDs
+    image_ids = []
+    invalid_docs = []
     
-    with st.spinner("Loading images..."):
-        loaded_images = load_multiple_images_parallel(image_ids)
+    for doc in current_page_images:
+        try:
+            # Check if document has _id field
+            if isinstance(doc, dict) and '_id' in doc:
+                image_ids.append(str(doc['_id']))
+            else:
+                # If document doesn't have expected structure, collect for debugging
+                invalid_docs.append(doc)
+        except Exception as e:
+            st.error(f"Error processing document: {str(e)}")
+            if isinstance(doc, dict):
+                st.write(f"Available keys: {list(doc.keys())}")
+            else:
+                st.write(f"Document is not a dictionary: {type(doc)}")
     
-    # Create mapping of IDs to loaded images
-    image_map = {img['metadata']['_id']: img for img in loaded_images if img is not None}
+    # Report on invalid documents if any
+    if invalid_docs:
+        st.warning(f"Found {len(invalid_docs)} documents with invalid structure")
+        with st.expander("Show invalid documents"):
+            for i, doc in enumerate(invalid_docs):
+                st.write(f"Document {i+1}:")
+                st.write(doc)
     
-    for idx, doc in enumerate(current_page_images):
-        with cols[idx % num_cols]:
-            image_id = str(doc['_id'])
-            image_data = image_map.get(image_id)
-            if image_data:
-                # Display thumbnail if available, otherwise original
-                display_img = image_data.get('thumbnail', image_data['original'])
-                st.image(
-                    display_img,
-                    caption=image_data['metadata']['filename'],
-                    use_container_width=True
-                )
-                st.caption(f"Uploaded: {image_data['metadata']['upload_date'].strftime('%Y-%m-%d %H:%M:%S')}")
+    # If we have valid image IDs, proceed with loading
+    if image_ids:
+        with st.spinner("Loading images..."):
+            loaded_images = load_multiple_images_parallel(image_ids)
+        
+        # Create mapping of IDs to loaded images
+        image_map = {img['metadata']['_id']: img for img in loaded_images if img is not None}
+        
+        for idx, doc in enumerate(current_page_images):
+            # Skip invalid documents
+            if idx >= len(image_ids):
+                continue
                 
-                # Create columns for buttons
-                button_cols = st.columns(2)
-                with button_cols[0]:
-                    # Use key parameter to ensure unique keys
-                    if st.button(f"Analyze", key=f"analyze_{image_id}"):
-                        st.session_state.selected_image = image_id
-                        
-                with button_cols[1]:
-                    if st.button(f"Remove", key=f"remove_{image_id}", type="secondary"):
-                        if remove_image_from_db(image_id):
-                            st.success("Image removed successfully")
-                            # Update stored_images in session state before rerun
-                            st.session_state.stored_images = get_stored_images()
-                            st.experimental_rerun()
+            image_id = image_ids[idx]
+            with cols[idx % num_cols]:
+                image_data = image_map.get(image_id)
+                if image_data:
+                    # Display thumbnail if available, otherwise original
+                    display_img = image_data.get('thumbnail', image_data['original'])
+                    st.image(
+                        display_img,
+                        caption=image_data['metadata']['filename'],
+                        use_container_width=True
+                    )
+                    st.caption(f"Uploaded: {image_data['metadata']['upload_date'].strftime('%Y-%m-%d %H:%M:%S')}")
+                    
+                    # Create columns for buttons
+                    button_cols = st.columns(2)
+                    with button_cols[0]:
+                        # Use key parameter to ensure unique keys
+                        if st.button(f"Analyze", key=f"analyze_{image_id}"):
+                            st.session_state.selected_image = image_id
+                            
+                    with button_cols[1]:
+                        if st.button(f"Remove", key=f"remove_{image_id}", type="secondary"):
+                            if remove_image_from_db(image_id):
+                                st.success("Image removed successfully")
+                                # Update stored_images in session state before rerun
+                                st.session_state.stored_images = get_stored_images()
+                                st.experimental_rerun()
+                else:
+                    st.error(f"Failed to load image {image_id}")
+    else:
+        st.error("No valid images found on this page")
+        
+        # Add a debug button to examine the document structure
+        if st.button("Debug Document Structure"):
+            st.write("First document structure:")
+            if current_page_images and len(current_page_images) > 0:
+                st.write(current_page_images[0])
+            else:
+                st.write("No documents available")
 
 @timing_decorator
 def create_comparison_view(image_data_list, index_type=None):
