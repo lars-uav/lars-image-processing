@@ -417,6 +417,64 @@ def save_image_to_db(uploaded_file):
     except Exception as e:
         st.error(f"Failed to process image: {str(e)}")
         return None
+    
+def repair_document_types(doc):
+    """
+    Convert string representations of special types back to their proper Python objects
+    """
+    if not isinstance(doc, dict):
+        return doc
+        
+    # Create a new document with properly converted fields
+    fixed_doc = {}
+    
+    # Handle _id field
+    if '_id' in doc:
+        id_str = doc['_id']
+        if isinstance(id_str, str) and 'ObjectId' in id_str:
+            # Extract the ObjectId from the string format "ObjectId('...')"
+            try:
+                id_value = id_str.replace("ObjectId('", "").replace("')", "").replace('")', "").replace('ObjectId("', "")
+                fixed_doc['_id'] = ObjectId(id_value)
+            except:
+                fixed_doc['_id'] = doc['_id']  # Keep as is if conversion fails
+        else:
+            fixed_doc['_id'] = doc['_id']
+    
+    # Handle metadata field
+    if 'metadata' in doc and isinstance(doc['metadata'], dict):
+        fixed_metadata = {}
+        for key, value in doc['metadata'].items():
+            # Convert datetime string representations
+            if isinstance(value, str) and 'datetime.datetime' in value:
+                try:
+                    # Parse datetime from string like "datetime.datetime(2025, 2, 5, 16, 46, 25, 723000)"
+                    date_parts = value.replace("datetime.datetime(", "").replace(")", "").split(", ")
+                    year, month, day, hour, minute, second, microsecond = map(int, date_parts)
+                    fixed_metadata[key] = datetime(year, month, day, hour, minute, second, microsecond)
+                except:
+                    fixed_metadata[key] = value  # Keep as is if conversion fails
+            # Fix image_dimensions array
+            elif key == 'image_dimensions' and isinstance(value, list):
+                # Convert to proper tuple/list format
+                if len(value) >= 2 and '0' in value and '1' in value:
+                    fixed_metadata[key] = (value[0], value[1])
+                else:
+                    fixed_metadata[key] = value
+            else:
+                fixed_metadata[key] = value
+        
+        fixed_doc['metadata'] = fixed_metadata
+    else:
+        # Copy other fields as is
+        fixed_doc['metadata'] = doc.get('metadata', {})
+    
+    # Copy any other fields not handled above
+    for key, value in doc.items():
+        if key not in ['_id', 'metadata']:
+            fixed_doc[key] = value
+    
+    return fixed_doc
 
 def remove_image_from_db(image_id):
     """Remove image from MongoDB"""
@@ -1200,7 +1258,7 @@ def calculate_index_statistics_by_timeframe(image_data_list, index_type):
 
 @timing_decorator
 def time_series_analysis_ui():
-    """UI for time series analysis of monitoring sites"""
+    """UI for time series analysis of monitoring sites with improved error handling"""
     st.header("Time Series Monitoring")
     
     # Side-by-side layout
@@ -1248,67 +1306,128 @@ def time_series_analysis_ui():
             selected_site = st.selectbox(
                 "Select Monitoring Site",
                 options=monitoring_sites,
-                format_func=lambda x: x['name'],
+                format_func=lambda x: x['name'] if isinstance(x, dict) and 'name' in x else "Unknown site",
                 key="site_selector"
             )
             
             if selected_site:
-                st.write(f"**Description:** {selected_site.get('description', 'No description')}")
-                if 'coordinates' in selected_site and selected_site['coordinates']:
-                    st.write(f"**Coordinates:** Lat: {selected_site['coordinates']['lat']}, Lng: {selected_site['coordinates']['lng']}")
-                
-                st.write(f"**Created:** {selected_site['created_date'].strftime('%Y-%m-%d')}")
-                st.write(f"**Last Updated:** {selected_site['last_updated'].strftime('%Y-%m-%d')}")
+                if isinstance(selected_site, dict):
+                    st.write(f"**Description:** {selected_site.get('description', 'No description')}")
+                    if 'coordinates' in selected_site and selected_site['coordinates']:
+                        st.write(f"**Coordinates:** Lat: {selected_site['coordinates']['lat']}, Lng: {selected_site['coordinates']['lng']}")
+                    
+                    st.write(f"**Created:** {selected_site['created_date'].strftime('%Y-%m-%d')}")
+                    st.write(f"**Last Updated:** {selected_site['last_updated'].strftime('%Y-%m-%d')}")
+                else:
+                    st.error(f"Selected site has invalid structure: {type(selected_site)}")
     
     # If a site is selected, show the image assignment panel and time series visualization
     if 'site_selector' in st.session_state and st.session_state.site_selector:
         selected_site = st.session_state.site_selector
         
+        # Validate selected_site is a dictionary with _id
+        if not isinstance(selected_site, dict) or '_id' not in selected_site:
+            st.error("Selected site has invalid structure. Please create a new site.")
+            return
+            
         with col2:
-            st.subheader(f"Time Series for {selected_site['name']}")
+            st.subheader(f"Time Series for {selected_site.get('name', 'Unknown Site')}")
             
             # Get images already assigned to this site
             site_images = get_site_images(str(selected_site['_id']))
             
             # Show option to assign new images to site
             with st.expander("Assign Images to Site"):
+                # Validate stored images structure
+                stored_images = st.session_state.get('stored_images', [])
+                valid_stored_images = []
+                invalid_stored_images = []
+                
+                for img in stored_images:
+                    if isinstance(img, dict) and '_id' in img:
+                        valid_stored_images.append(img)
+                    else:
+                        invalid_stored_images.append(img)
+                
+                # Report on invalid images
+                if invalid_stored_images:
+                    st.warning(f"Found {len(invalid_stored_images)} images with invalid structure. These will be skipped.")
+                
                 # Get all images not already assigned to this site
-                unassigned_images = [img for img in st.session_state.stored_images 
-                                    if not any(site_img['_id'] == img['_id'] for site_img in site_images)]
+                unassigned_images = []
+                for img in valid_stored_images:
+                    # Extract the img _id once for efficiency
+                    img_id = img['_id']
+                    
+                    # Check if this image is already assigned to the site
+                    is_assigned = False
+                    for site_img in site_images:
+                        if isinstance(site_img, dict) and '_id' in site_img:
+                            if site_img['_id'] == img_id:
+                                is_assigned = True
+                                break
+                    
+                    if not is_assigned:
+                        unassigned_images.append(img)
                 
                 if not unassigned_images:
                     st.info("No unassigned images available.")
                 else:
                     # Create multiselect for unassigned images
-                    image_options = {str(img['_id']): img['metadata']['filename'] for img in unassigned_images}
+                    image_options = {}
+                    for img in unassigned_images:
+                        try:
+                            # Safely extract filename from metadata if available
+                            if isinstance(img, dict) and '_id' in img:
+                                img_id = str(img['_id'])
+                                if 'metadata' in img and isinstance(img['metadata'], dict) and 'filename' in img['metadata']:
+                                    filename = img['metadata']['filename']
+                                else:
+                                    filename = f"Image {img_id[-6:]}"
+                                image_options[img_id] = filename
+                        except Exception as e:
+                            st.error(f"Error processing image: {str(e)}")
                     
-                    selected_images = st.multiselect(
-                        "Select Images to Assign",
-                        options=list(image_options.keys()),
-                        format_func=lambda x: image_options[x]
-                    )
-                    
-                    if selected_images and st.button("Assign to Site"):
-                        with st.spinner(f"Assigning {len(selected_images)} images..."):
-                            success_count = 0
-                            for img_id in selected_images:
-                                if assign_image_to_site(img_id, str(selected_site['_id'])):
-                                    success_count += 1
-                            
-                            if success_count > 0:
-                                st.success(f"Successfully assigned {success_count} images to {selected_site['name']}")
-                                # Refresh site images
-                                site_images = get_site_images(str(selected_site['_id']))
+                    if image_options:
+                        selected_images = st.multiselect(
+                            "Select Images to Assign",
+                            options=list(image_options.keys()),
+                            format_func=lambda x: image_options.get(x, x)
+                        )
+                        
+                        if selected_images and st.button("Assign to Site"):
+                            with st.spinner(f"Assigning {len(selected_images)} images..."):
+                                success_count = 0
+                                for img_id in selected_images:
+                                    if assign_image_to_site(img_id, str(selected_site['_id'])):
+                                        success_count += 1
+                                
+                                if success_count > 0:
+                                    st.success(f"Successfully assigned {success_count} images to {selected_site.get('name', 'site')}")
+                                    # Refresh site images
+                                    site_images = get_site_images(str(selected_site['_id']))
+                    else:
+                        st.info("No valid unassigned images available.")
             
             # Display time series analysis for site images
             if not site_images:
-                st.info(f"No images assigned to {selected_site['name']} yet. Assign images to begin analysis.")
+                st.info(f"No images assigned to this site yet. Assign images to begin analysis.")
             else:
+                # Validate site images structure
+                valid_site_images = []
+                for img in site_images:
+                    if isinstance(img, dict) and '_id' in img:
+                        valid_site_images.append(img)
+                
+                if not valid_site_images:
+                    st.warning("No valid images found for this site.")
+                    return
+                
                 # Load image data for all site images
                 image_data_list = []
                 with st.spinner("Loading site images..."):
                     # Load images in parallel
-                    image_ids = [str(img['_id']) for img in site_images]
+                    image_ids = [str(img['_id']) for img in valid_site_images]
                     loaded_images = load_multiple_images_parallel(image_ids)
                     image_data_list = loaded_images
                 
