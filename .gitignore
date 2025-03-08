@@ -3,3 +3,4 @@ ndvi_analysis
 .DS_Store
 .env
 debug.py
+db_create_index.py
