@@ -982,6 +982,8 @@ def create_change_detection_visualization(image_pair, index_type):
     
     return img_copy
 
+# Here's the updated time_series_analysis_ui function with st.rerun() instead of st.experimental_rerun()
+
 def time_series_analysis_ui():
     """Memory-optimized UI for time series analysis of monitoring sites"""
     st.header("Time Series Monitoring")
@@ -1017,6 +1019,7 @@ def time_series_analysis_ui():
                         st.success(f"Site '{site_name}' created successfully!")
                         # Force refresh the site list
                         st.session_state.monitoring_sites = get_all_monitoring_sites()
+                        st.rerun()  # Changed from st.experimental_rerun()
         
         # Display available sites
         monitoring_sites = get_all_monitoring_sites()
@@ -1081,6 +1084,7 @@ def time_series_analysis_ui():
                                 st.success(f"Successfully assigned {success_count} images to {selected_site['name']}")
                                 # Refresh site images
                                 site_images = get_site_images(str(selected_site['_id']))
+                                st.rerun()  # Changed from st.experimental_rerun()
             
             # Display time series analysis for site images
             if not site_images:
@@ -1243,7 +1247,7 @@ def main():
                         st.success(f"Successfully uploaded {uploaded_file.name}")
             
             # Clear the file uploader after processing
-            st.experimental_rerun()
+            st.rerun()
         
         # Database Management section
         with st.expander("Database Management"):
@@ -1256,7 +1260,7 @@ def main():
                     # Force refresh
                     if 'stored_images' in st.session_state:
                         del st.session_state.stored_images
-                    st.experimental_rerun()
+                    st.rerun()
                 else:
                     st.info("No duplicate images found")
             
@@ -1278,7 +1282,7 @@ def main():
                                 for key in list(st.session_state.keys()):
                                     if key not in ['page_number', 'tab_index']:
                                         del st.session_state[key]
-                                st.experimental_rerun()
+                                st.rerun()
                         except Exception as e:
                             st.error(f"Failed to clear database: {str(e)}")
         
@@ -1318,7 +1322,7 @@ def main():
                     # Clear stored images to force reload on next run
                     if 'stored_images' in st.session_state:
                         del st.session_state.stored_images
-                    st.experimental_rerun()
+                    st.rerun()
             
             with col2:
                 st.write(f"Page {st.session_state.page_number + 1} of {st.session_state.total_pages} • {st.session_state.total_images} Total Images")
@@ -1329,7 +1333,7 @@ def main():
                     # Clear stored images to force reload on next run
                     if 'stored_images' in st.session_state:
                         del st.session_state.stored_images
-                    st.experimental_rerun()
+                    st.rerun()
         
         # Display gallery with current page images
         if 'stored_images' in st.session_state:
@@ -1385,7 +1389,7 @@ def main():
                                 # Force refresh
                                 if 'stored_images' in st.session_state:
                                     del st.session_state.stored_images
-                                st.experimental_rerun()
+                                st.rerun()
         
         # Comparison Analysis Section - Only load when needed
         if st.session_state.selected_images:
@@ -1470,7 +1474,7 @@ def main():
                             st.session_state.analyzed_image_ids = st.session_state.selected_images.copy()
                             
                             # Force a rerun to display results
-                            st.experimental_rerun()
+                            st.rerun()
                 
                 # Display analysis results if available
                 if st.session_state.analysis_complete and 'analysis_results' in st.session_state:
@@ -1589,7 +1593,7 @@ def main():
                     gc.collect()
                     
                     # Rerun to update UI
-                    st.experimental_rerun()
+                    st.rerun()
     
     # Time Series Monitoring Tab
     with tab2:
