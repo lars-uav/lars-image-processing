@@ -119,15 +119,11 @@ def get_stored_images(limit=12, skip=0, include_total=False):
         if include_total:
             total = db.images.count_documents({})
         
-        # Only fetch metadata fields, not full image data
+        # Only fetch metadata fields using inclusion projection
+        # Don't include image_data field (don't use exclusion)
         projection = {
-            'metadata.filename': 1, 
-            'metadata.upload_date': 1,
-            'metadata.image_dimensions': 1,
-            'metadata.file_size_mb': 1,
-            '_id': 1,
-            # Explicitly exclude the binary data
-            'image_data': 0
+            'metadata': 1, 
+            '_id': 1
         }
         
         # Use cursor to avoid loading all results into memory at once
