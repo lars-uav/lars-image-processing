@@ -198,7 +198,7 @@ def load_image_from_db(image_id, thumbnail=False):
         return None
 
 def save_image_to_db(uploaded_file):
-    """Save image with optimized storage and preprocessing"""
+    """Save image with improved duplicate detection and error handling"""
     try:
         # Check file size first
         file_content = uploaded_file.getvalue()
@@ -217,8 +217,8 @@ def save_image_to_db(uploaded_file):
             
         db = client.rgnir_analyzer
         
-        # Check if image with same hash already exists
-        existing_image = db.images.find_one({'metadata.file_hash': file_hash}, {'_id': 1})
+        # Improved duplicate check with more robust query
+        existing_image = db.images.find_one({"metadata.file_hash": file_hash})
         if existing_image:
             st.warning(f"Image {uploaded_file.name} is a duplicate and was not uploaded.")
             return None
@@ -263,9 +263,19 @@ def save_image_to_db(uploaded_file):
                 'image_data': Binary(file_content)
             }
             
-            # Insert into MongoDB
-            result = db.images.insert_one(document)
-            return str(result.inserted_id)
+            # Insert into MongoDB with specific error handling for duplicates
+            try:
+                result = db.images.insert_one(document)
+                return str(result.inserted_id)
+            except Exception as e:
+                error_str = str(e)
+                if "duplicate key error" in error_str or "E11000" in error_str:
+                    st.warning(f"Image {uploaded_file.name} is a duplicate (hash: {file_hash}) and was not uploaded.")
+                elif "document too large" in error_str.lower():
+                    st.error(f"File size ({file_size:.1f}MB) is too large for MongoDB. Please resize the image.")
+                else:
+                    st.error(f"Database error: {error_str}")
+                return None
                 
         except Exception as e:
             st.error(f"Invalid image file: {str(e)}")
