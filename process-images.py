@@ -1395,9 +1395,29 @@ def main():
             if len(st.session_state.selected_images) == 0:
                 st.warning("No images selected for comparison")
             else:
+                # Initialize analysis state if not exists
+                if 'analysis_complete' not in st.session_state:
+                    st.session_state.analysis_complete = False
+                if 'analyzed_image_ids' not in st.session_state:
+                    st.session_state.analyzed_image_ids = []
+                if 'analysis_results' not in st.session_state:
+                    st.session_state.analysis_results = {}
+                    
+                # Check if we need to run analysis (images changed or first time)
+                need_analysis = not st.session_state.analysis_complete or \
+                                sorted(st.session_state.selected_images) != sorted(st.session_state.analyzed_image_ids)
+                
                 # Let user trigger the analysis explicitly
-                if st.button("Generate Comparison Analysis"):
+                if need_analysis and st.button("Generate Comparison Analysis"):
                     with st.spinner("Loading and processing selected images..."):
+                        # Reset analysis state
+                        st.session_state.analysis_results = {
+                            'image_data_list': [],
+                            'original_comparison': None,
+                            'wb_comparison': None,
+                            'indices': {}
+                        }
+                        
                         # Load images one by one
                         image_data_list = []
                         progress_bar = st.progress(0)
@@ -1418,10 +1438,9 @@ def main():
                             st.warning("No valid images selected for comparison")
                         else:                   
                             # Show original images comparison
-                            st.subheader("Original Images")
                             comparison_image, _ = create_comparison_view(image_data_list)
                             if comparison_image:
-                                st.image(comparison_image, use_container_width=True)
+                                st.session_state.analysis_results['original_comparison'] = comparison_image
                             
                             # Pre-compute white balance for all images to save memory
                             for img_data in image_data_list:
@@ -1433,7 +1452,6 @@ def main():
                             gc.collect()
                             
                             # Show white-balanced comparison
-                            st.subheader("White Balance Corrected")
                             # Create a simplified list using only corrected arrays
                             wb_list = [{
                                 'array': img['corrected_array'],  
@@ -1442,17 +1460,45 @@ def main():
                             
                             comparison_image, _ = create_comparison_view(wb_list)
                             if comparison_image:
-                                st.image(comparison_image, use_container_width=True)
+                                st.session_state.analysis_results['wb_comparison'] = comparison_image
                             
-                            # Index selection
-                            selected_indices = st.multiselect(
-                                "Select Indices to Compare",
-                                ["NDVI", "GNDVI", "NDWI"],
-                                default=[]
-                            )
+                            # Store the processed image data for future index calculations
+                            st.session_state.analysis_results['image_data_list'] = image_data_list
                             
-                            # Process selected indices one at a time
-                            for index_type in selected_indices:
+                            # Mark analysis as complete and store which images were analyzed
+                            st.session_state.analysis_complete = True
+                            st.session_state.analyzed_image_ids = st.session_state.selected_images.copy()
+                            
+                            # Force a rerun to display results
+                            st.experimental_rerun()
+                
+                # Display analysis results if available
+                if st.session_state.analysis_complete and 'analysis_results' in st.session_state:
+                    results = st.session_state.analysis_results
+                    
+                    # Show original comparison
+                    if 'original_comparison' in results and results['original_comparison'] is not None:
+                        st.subheader("Original Images")
+                        st.image(results['original_comparison'], use_container_width=True)
+                    
+                    # Show white-balanced comparison
+                    if 'wb_comparison' in results and results['wb_comparison'] is not None:
+                        st.subheader("White Balance Corrected")
+                        st.image(results['wb_comparison'], use_container_width=True)
+                    
+                    # Only show index selection if we have images loaded
+                    if 'image_data_list' in results and results['image_data_list']:
+                        # Index selection - this won't reset state now
+                        selected_indices = st.multiselect(
+                            "Select Indices to Compare",
+                            ["NDVI", "GNDVI", "NDWI"],
+                            default=[]
+                        )
+                        
+                        # Process selected indices one at a time
+                        for index_type in selected_indices:
+                            # Check if we already calculated this index
+                            if index_type not in results['indices']:
                                 st.subheader(f"{index_type} Comparison")
                                 
                                 # Process this index
@@ -1461,7 +1507,7 @@ def main():
                                     index_data_list = []
                                     all_stats = {}
                                     
-                                    for img_data in image_data_list:
+                                    for img_data in results['image_data_list']:
                                         # Calculate index
                                         index_array = calculate_index(img_data['corrected_array'], index_type)
                                         
@@ -1476,50 +1522,74 @@ def main():
                                         })
                                     
                                     # Create visualization
-                                    comparison_image, _ = create_comparison_view(index_data_list, index_type)
-                                    if comparison_image:
-                                        st.image(comparison_image, use_container_width=True)
+                                    comparison_image, stats = create_comparison_view(index_data_list, index_type)
                                     
-                                    # Display statistics in columns
-                                    if all_stats:
-                                        st.write(f"{index_type} Statistics")
-                                        cols = st.columns(len(all_stats))
-                                        for idx, (filename, img_stats) in enumerate(all_stats.items()):
-                                            with cols[idx]:
-                                                st.write(f"**{filename}**")
-                                                for key, value in img_stats.items():
-                                                    st.metric(key, f"{value:.3f}")
-                                
-                                # Clear data after each index processing
-                                index_data_list = None
-                                all_stats = None
-                                
-                                # Force garbage collection
-                                gc.collect()
+                                    # Store results
+                                    results['indices'][index_type] = {
+                                        'comparison': comparison_image,
+                                        'stats': stats
+                                    }
+                                    
+                                    # Clear data after processing
+                                    index_data_list = None
+                                    
+                                    # Force garbage collection
+                                    gc.collect()
                             
-                            # Add download option if indices were processed
-                            if selected_indices:
-                                # Create ZIP file with processed images
-                                if st.button("Prepare Download Package"):
-                                    with st.spinner("Creating download package..."):
-                                        # Get the first image's corrected array
-                                        first_img = image_data_list[0]
-                                        corrected_array = first_img['corrected_array']
-                                        
-                                        # Create download package
-                                        zip_data = download_processed_images(
-                                            first_img, 
-                                            corrected_array, 
-                                            selected_indices
-                                        )
-                                        
-                                        # Offer download
-                                        st.download_button(
-                                            label="Download Processed Images",
-                                            data=zip_data,
-                                            file_name="processed_images.zip",
-                                            mime="application/zip"
-                                        )
+                            # Display the index visualization and stats
+                            if index_type in results['indices']:
+                                index_result = results['indices'][index_type]
+                                
+                                st.subheader(f"{index_type} Comparison")
+                                if 'comparison' in index_result and index_result['comparison'] is not None:
+                                    st.image(index_result['comparison'], use_container_width=True)
+                                
+                                # Display statistics in columns
+                                if 'stats' in index_result and index_result['stats']:
+                                    st.write(f"{index_type} Statistics")
+                                    cols = st.columns(len(index_result['stats']))
+                                    for idx, (filename, img_stats) in enumerate(index_result['stats'].items()):
+                                        with cols[idx]:
+                                            st.write(f"**{filename}**")
+                                            for key, value in img_stats.items():
+                                                st.metric(key, f"{value:.3f}")
+                        
+                        # Add download option if indices were processed
+                        if selected_indices and results['image_data_list']:
+                            # Create ZIP file with processed images
+                            if st.button("Prepare Download Package"):
+                                with st.spinner("Creating download package..."):
+                                    # Get the first image's corrected array
+                                    first_img = results['image_data_list'][0]
+                                    corrected_array = first_img['corrected_array']
+                                    
+                                    # Create download package
+                                    zip_data = download_processed_images(
+                                        first_img, 
+                                        corrected_array, 
+                                        selected_indices
+                                    )
+                                    
+                                    # Offer download
+                                    st.download_button(
+                                        label="Download Processed Images",
+                                        data=zip_data,
+                                        file_name="processed_images.zip",
+                                        mime="application/zip"
+                                    )
+                        
+                # Add a button to reset analysis if needed
+                if st.session_state.analysis_complete and st.button("Reset Analysis"):
+                    # Clear analysis state
+                    st.session_state.analysis_complete = False
+                    st.session_state.analyzed_image_ids = []
+                    st.session_state.analysis_results = {}
+                    
+                    # Force garbage collection
+                    gc.collect()
+                    
+                    # Rerun to update UI
+                    st.experimental_rerun()
     
     # Time Series Monitoring Tab
     with tab2:
