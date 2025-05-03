@@ -2,7 +2,7 @@
 
 ## Overview
 
-A poweerful application designed for analyzing multispectral (RGNir) images. This tool provides advanced image processing capabilities, allowing users to upload, store, and analyze images with features like white balance correction and vegetation/water index calculations.
+A powerful application designed for analyzing multispectral (RGNir) images. This tool provides advanced image processing capabilities, allowing users to upload, store, and analyze images with features like white balance correction and vegetation/water index calculations.
 
 ## Features
 
